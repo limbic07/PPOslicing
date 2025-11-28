@@ -1,9 +1,9 @@
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 from env_5g_ra import FiveGResourceAllocationEnv
-
+from env_5g_sla import FiveG_SLA_Env
 # 1. 初始化环境
-env = FiveGResourceAllocationEnv()
+env = FiveG_SLA_Env()
 
 # 2. 检查环境是否合规 (Debug)
 check_env(env)
