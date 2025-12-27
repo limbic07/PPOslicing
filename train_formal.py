@@ -1,9 +1,7 @@
 import os
-import gymnasium as gym
-import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.monitor import Monitor
 
 # 引入SLA 环境
@@ -80,9 +78,8 @@ if __name__ == "__main__":
     print(f"Logs will be saved to: {log_dir}")
     print(f"Best model will be saved to: {models_dir}")
 
-    # 建议步数：1,000,000 (一百万步)
-    # 对于 CPU 来说，跑完大概需要 15-30 分钟
-    TOTAL_TIMESTEPS = 200000
+    # 步数：500,000
+    TOTAL_TIMESTEPS = 500,000
 
     model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=eval_callback)
 

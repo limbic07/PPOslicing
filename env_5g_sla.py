@@ -18,20 +18,20 @@ class FiveG_SLA_Env(gym.Env):
         super(FiveG_SLA_Env, self).__init__()
 
         # --- System Constants (系统常数) ---
-        self.total_bandwidth = 100e6  # 100 MHz
-        self.duration_tti = 1e-3  # 1ms per TTI (Time Slot duration)
+        self.total_bandwidth = 20e6  # 20 MHz
+        self.duration_tti = 0.5e-3  # 0.5ms per TTI (Time Slot duration)
 
         # --- SLA Parameters (SLA 参数配置) ---
         self.sla_props = {
-            # eMBB: Minimum 100 Mbps throughput required
-            'embb_gbr': 100.0,
+            # eMBB: Minimum 40 Mbps throughput required
+            'embb_gbr': 40.0,
 
-            # URLLC: Max 5ms delay allowed.
+            # URLLC: Max 2ms delay allowed.
             # 延迟估算公式: Delay = Queue_Size / Service_Rate
-            'urllc_max_delay': 0.005,
+            'urllc_max_delay': 0.002,
 
             # mMTC: Max queue size (buffer depth) to prevent packet loss
-            'mmtc_max_queue': 100.0  # Mb data in buffer
+            'mmtc_max_queue': 5.0  # Mb data in buffer
         }
 
         # --- Action Space (动作空间) ---
@@ -42,7 +42,7 @@ class FiveG_SLA_Env(gym.Env):
         # --- Observation Space (状态空间) ---
         # 维度增加到 9 维:
         # 1-3. Traffic Arrivals (Instantaneous Demand) [Mbps]
-        # 4-6. Queue Backlog (Accumulated Data) [Mb] <-- NEW! (新增队列状态)
+        # 4-6. Queue Backlog (Accumulated Data) [Mb]
         # 7-9. Spectral Efficiency (Channel Quality) [bits/s/Hz]
         self.observation_space = spaces.Box(low=0, high=np.inf, shape=(9,), dtype=np.float32)
 
@@ -149,26 +149,41 @@ class FiveG_SLA_Env(gym.Env):
         info = {
             "queue_sizes": self.queues.copy(),
             "violations": violations,
+            "throughput": np.sum(achieved_throughput_mbps),
             "est_urllc_delay": est_delay if 'est_delay' in locals() else 0
         }
 
         return self.state, reward, terminated, truncated, info
 
     def _update_state(self):
-        """
-        Generate new traffic arrivals and channel conditions.
-        """
-        # 1. Traffic Arrivals (Mbps) -> similar to previous code
-        arr_embb = np.random.uniform(100, 500)
-        arr_urllc = np.random.poisson(lam=20) * 5.0  # Random bursts
-        arr_mmtc = np.random.normal(30, 5)
 
-        # 2. Spectral Efficiency (SE)
-        se_embb = np.random.uniform(4.0, 8.0)
-        se_urllc = np.random.uniform(2.0, 5.0)
-        se_mmtc = np.random.uniform(1.0, 3.0)
+        # --- 1. eMBB: Video Streaming (Truncated Gaussian) ---
+        # 均值 60Mbps，标准差 10Mbps，最小 40，最大 90
+        # 这样 eMBB 自己就几乎把 80Mbps 的管道吃满了
+        arr_embb = np.clip(np.random.normal(60, 10), 40, 90)
 
-        # Fill state (Queues will be filled in step function or kept from prev)
-        # We only update Arrivals and SE here. Queues are persistent.
+        # --- 2. URLLC: Industrial Automation (Poisson Burst) ---
+        # 模拟机器臂控制信号。平时很低，偶尔突发。
+        # 均值设为 10Mbps，但突发能到 30Mbps (占带宽的 30%!)
+        # Poisson 的 lambda 参数控制突发频率
+        if np.random.rand() > 0.8:  # 20% 概率突发
+            arr_urllc = np.random.normal(25, 5)  # 突发状态
+        else:
+            arr_urllc = np.random.normal(5, 1)  # 静默状态
+
+        # --- 3. mMTC: Sensor Data (Constant + Noise) ---
+        # 几乎恒定，压力很小
+        arr_mmtc = np.random.normal(2, 0.1)
+
+        # --- 4. 物理信道 (Spectral Efficiency) ---
+        # 模拟典型的 Rayleigh 衰落或阴影衰落
+        # eMBB 用户通常在中心，SE 较高 (3-6)
+        se_embb = np.random.uniform(3.0, 6.0)
+        # URLLC 必须可靠，通常采用低 MCS 编码，所以有效 SE 较低 (1-3)
+        se_urllc = np.random.uniform(1.5, 3.5)
+        # mMTC 也是边缘设备，信号一般 (1-2)
+        se_mmtc = np.random.uniform(1.0, 2.5)
+
+        # 更新状态
         self.state[0:3] = [arr_embb, arr_urllc, arr_mmtc]
         self.state[6:9] = [se_embb, se_urllc, se_mmtc]

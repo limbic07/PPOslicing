@@ -58,8 +58,8 @@ def analyze_urllc():
         ratios = exp_action / np.sum(exp_action)
         urllc_ratio = ratios[1]
 
-        # 计算获得的容量 Capacity (Mbps) = Ratio * 100MHz * SE / 1e6
-        cap_urllc = (urllc_ratio * 100e6 * se_urllc) / 1e6
+        # 计算获得的容量 Capacity (Mbps) = Ratio * 20MHz * SE / 1e6
+        cap_urllc = (urllc_ratio * 20e6 * se_urllc) / 1e6
 
         # 4. 估算实时延迟 (Little's Law approximation)
         # Delay (ms) = Queue (Mb) / Capacity (Mbps) * 1000
@@ -88,13 +88,13 @@ def plot_urllc_details(data, steps):
     # 统计数据
     avg_lat = np.mean(data['latency'])
     max_lat = np.max(data['latency'])
-    violations = np.sum(np.array(data['latency']) > 5.0)  # 假设 5ms SLA
+    violations = np.sum(np.array(data['latency']) > 2.0)  # 假设 2ms SLA
 
     print("=" * 30)
     print(f"URLLC 性能统计 ({steps} TTI):")
     print(f"平均延迟: {avg_lat:.4f} ms")
     print(f"最大延迟: {max_lat:.4f} ms")
-    print(f"SLA违约次数 (>5ms): {violations} 次")
+    print(f"SLA违约次数 (>2ms): {violations} 次")
     print("=" * 30)
 
     # 绘图设置
@@ -121,8 +121,8 @@ def plot_urllc_details(data, steps):
 
     # 子图 3: 实时延迟 (关键 SLA 指标)
     axes[2].plot(t, data['latency'], color='blue', linewidth=1.5, label='Real-time Latency')
-    # 画一条 5ms 的红线 (SLA 阈值)
-    axes[2].axhline(y=5.0, color='red', linestyle='--', linewidth=2, label='SLA Limit (5ms)')
+    # 画一条 2ms 的红线 (SLA 阈值)
+    axes[2].axhline(y=2.0, color='red', linestyle='--', linewidth=2, label='SLA Limit (2ms)')
     axes[2].set_title(f"URLLC: Latency Performance (Avg: {avg_lat:.2f}ms)", fontsize=14)
     axes[2].set_ylabel("Latency (ms)")
     axes[2].set_xlabel("Time (TTI)")
