@@ -1,26 +1,51 @@
+import os
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize,VecFrameStack
+
+
+# ==========================================
+# 0. 核心修正：路径配置 (稳健版)
+# ==========================================
+# 获取当前脚本的绝对路径
+current_script_path = os.path.abspath(__file__)
+# 获取 analysis 目录
+analysis_dir = os.path.dirname(current_script_path)
+# 获取项目根目录 (PPOslicing/)
+project_root = os.path.dirname(analysis_dir)
+
+# 将根目录加入 Python 搜索路径，以便导入 env_5g_sla
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+# 导入环境
 from env_5g_sla import FiveG_SLA_Env
 
-# --- 配置路径 ---
-# 必须和 train_formal.py 里的路径一致
-model_path = "./models_formal/best_model.zip"
-stats_path = "./models_formal/vec_normalize.pkl"
+# 定义资源路径
+models_dir = os.path.join(project_root, "models_formal")
+model_path = os.path.join(models_dir, "best_model.zip")
+stats_path = os.path.join(models_dir, "vec_normalize.pkl")
 
 
 def run_test():
     print(f"Loading model from: {model_path}")
     print(f"Loading stats from: {stats_path}")
 
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"找不到模型文件: {model_path}")
+
     # --- 1. 重建环境并加载统计数据 (Crucial Step!) ---
     # 必须先创建一个 DummyVecEnv
     env = DummyVecEnv([lambda: FiveG_SLA_Env()])
-
+    env = VecFrameStack(env, n_stack=4)
     # 然后加载训练时的归一化参数 (Mean/Var)
-    # 如果不加载这个，模型看到的 State 数值范围不对，表现会很差
-    env = VecNormalize.load(stats_path, env)
+    try:
+        env = VecNormalize.load(stats_path, env)
+    except Exception as e:
+        print(f"错误：无法加载统计文件 {stats_path}. 请检查文件是否存在。")
+        raise e
 
     # 测试模式设置：
     # training=False: 不要更新均值方差，保持静止
@@ -55,8 +80,6 @@ def run_test():
 
         # --- 记录数据用于画图 ---
         # 反推 Action 对应的比例 (Softmax)
-        # 注意：这里需要手动重算一下比例，方便记录
-        # 因为 model 输出的是 [-1, 1] 的原始值
         raw_action = action[0]  # 取出 batch 中的第一个
         exp_action = np.exp(raw_action)
         ratios = exp_action / np.sum(exp_action)
@@ -65,12 +88,7 @@ def run_test():
         history["action_ratios"].append(ratios)
         history["rewards"].append(rewards[0])
 
-        # 从 State 中恢复 Demand 数据 (State索引 0-2)
-        # 注意：obs 是归一化过的，不能直接用。
-        # 我们用 info 里记录的数据，或者从 env.get_original_obs() 获取
-        # 简单起见，我们在 env_5g_sla.py 的 info 里其实没存 Demand，
-        # 这里为了画图方便，我们在 env_5g_sla.py 的 info 里加了 queue_sizes。
-        # 下面是一个技巧：直接访问环境内部变量 (不太推荐但画图最方便)
+        # 获取环境内部状态
         real_env = env.envs[0]
         history["demands"].append(real_env.state[0:3].copy())  # 原始 Demand
         history["queues"].append(info["queue_sizes"])
@@ -90,7 +108,7 @@ def plot_results(history):
     steps = range(len(ratios))
 
     # 设置字体，防止中文乱码 (如果你是中文系统)
-    plt.rcParams['font.sans-serif'] = ['SimHei']
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
     plt.rcParams['axes.unicode_minus'] = False
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
@@ -110,7 +128,7 @@ def plot_results(history):
     # 重点展示：当 URLLC 突发时，Agent 是否给了带宽？
     ax2 = axes[1]
     ax2.plot(steps, demands[:, 1], 'r--', label='URLLC Demand (Mbps)', linewidth=1.5)
-    # 计算实际给 URLLC 分了多少带宽 (假设总量 100MHz, 简单映射为处理能力)
+    # 计算实际给 URLLC 分了多少带宽 (假设总量 20MHz, 简单映射为处理能力)
     # 这里画带宽比例作为参考
     ax2_twin = ax2.twinx()
     ax2_twin.plot(steps, ratios[:, 1], 'orange', label='Allocated Ratio', linewidth=2)
@@ -137,8 +155,11 @@ def plot_results(history):
     axes[2].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("./models_formal/test_result_plot.png", dpi=300)
-    print("结果图已保存至 ./models_formal/test_result_plot.png")
+
+    # --- 修正：保存路径 ---
+    save_path = os.path.join(models_dir, "test_result_plot.png")
+    plt.savefig(save_path, dpi=300)
+    print(f"结果图已保存至 {save_path}")
     plt.show()
 
 

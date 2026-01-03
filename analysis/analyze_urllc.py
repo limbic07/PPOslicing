@@ -2,12 +2,12 @@ import gymnasium as gym
 import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize,VecFrameStack
 from env_5g_sla import FiveG_SLA_Env
 
 # --- 配置路径 ---
-model_path = "./models_formal/best_model.zip"
-stats_path = "./models_formal/vec_normalize.pkl"
+model_path = "../models_formal/best_model.zip"
+stats_path = "../models_formal/vec_normalize.pkl"
 
 
 def analyze_urllc():
@@ -15,6 +15,7 @@ def analyze_urllc():
 
     # 1. 环境重建 (必须与训练一致)
     env = DummyVecEnv([lambda: FiveG_SLA_Env()])
+    env = VecFrameStack(env, n_stack=4)
     env = VecNormalize.load(stats_path, env)
     env.training = False
     env.norm_reward = False
@@ -133,7 +134,7 @@ def plot_urllc_details(data, steps):
         axes[2].set_ylim(0, 10)
 
     plt.tight_layout()
-    save_path = "./models_formal/urllc_analysis.png"
+    save_path = "../models_formal/urllc_analysis.png"
     plt.savefig(save_path, dpi=300)
     print(f"URLLC 分析图已保存至: {save_path}")
     plt.show()
