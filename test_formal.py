@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
@@ -136,9 +137,14 @@ def plot_results(history):
     axes[2].legend()
     axes[2].grid(True, alpha=0.3)
 
+    # --- 5. 确保结果文件夹存在 ---
+    results_dir = "./results"
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+
     plt.tight_layout()
-    plt.savefig("./models_formal/test_result_plot.png", dpi=300)
-    print("结果图已保存至 ./models_formal/test_result_plot.png")
+    plt.savefig(f"{results_dir}/test_result_plot.png", dpi=300)
+    print(f"结果图已保存至 {results_dir}/test_result_plot.png")
     plt.show()
 
 

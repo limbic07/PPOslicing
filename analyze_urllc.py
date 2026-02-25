@@ -1,4 +1,5 @@
 import gymnasium as gym
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
@@ -133,7 +134,12 @@ def plot_urllc_details(data, steps):
         axes[2].set_ylim(0, 10)
 
     plt.tight_layout()
-    save_path = "./models_formal/urllc_analysis.png"
+    
+    results_dir = "./results"
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+        
+    save_path = f"{results_dir}/urllc_analysis.png"
     plt.savefig(save_path, dpi=300)
     print(f"URLLC 分析图已保存至: {save_path}")
     plt.show()

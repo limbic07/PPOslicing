@@ -18,20 +18,22 @@ class FiveG_SLA_Env(gym.Env):
         super(FiveG_SLA_Env, self).__init__()
 
         # --- System Constants (系统常数) ---
-        self.total_bandwidth = 20e6  # 20 MHz
-        self.duration_tti = 0.5e-3  # 0.5ms per TTI (Time Slot duration)
+        # 考虑到后续多小区扩展，设定标准 5G Sub-6GHz 单载波带宽
+        self.total_bandwidth = 100e6  # 100 MHz (Typical for C-band)
+        self.duration_tti = 0.5e-3  # 0.5ms per TTI (Numerology 1, 30kHz SCS)
 
         # --- SLA Parameters (SLA 参数配置) ---
         self.sla_props = {
-            # eMBB: Minimum 40 Mbps throughput required
-            'embb_gbr': 40.0,
+            # eMBB: Minimum 120 Mbps throughput required
+            # 提高底线 (100 -> 120): 压缩 Agent 的容错空间，让它不能肆无忌惮地剥削 eMBB
+            'embb_gbr': 120.0,
 
             # URLLC: Max 2ms delay allowed.
-            # 延迟估算公式: Delay = Queue_Size / Service_Rate
             'urllc_max_delay': 0.002,
 
             # mMTC: Max queue size (buffer depth) to prevent packet loss
-            'mmtc_max_queue': 5.0  # Mb data in buffer
+            # 修复漏洞：降至 1.0 Mb。若设为 20Mb，200步内根本无法填满，导致约束失效。
+            'mmtc_max_queue': 1.0  # Mb data in buffer
         }
 
         # --- Action Space (动作空间) ---
@@ -40,26 +42,43 @@ class FiveG_SLA_Env(gym.Env):
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
 
         # --- Observation Space (状态空间) ---
-        # 维度增加到 9 维:
-        # 1-3. Traffic Arrivals (Instantaneous Demand) [Mbps]
-        # 4-6. Queue Backlog (Accumulated Data) [Mb]
-        # 7-9. Spectral Efficiency (Channel Quality) [bits/s/Hz]
-        self.observation_space = spaces.Box(low=0, high=np.inf, shape=(9,), dtype=np.float32)
+        # 维度扩展到 14 维 (强化特征工程):
+        # 1-3 (0:3). Traffic Arrivals (Instantaneous Demand) [Mbps]
+        # 4-6 (3:6). Queue Backlog (Accumulated Data) [Mb]
+        # 7-9 (6:9). Spectral Efficiency (Channel Quality) [bits/s/Hz]
+        # 10-12 (9:12). Previous Action (Bandwidth Ratios allocated in the last step) [0~1]
+        # 13 (12). URLLC Estimated Delay [ms] (Critical Alert Feature)
+        # 14 (13). eMBB GBR Shortfall [Mbps] (Critical Alert Feature)
+        self.observation_space = spaces.Box(low=0, high=np.inf, shape=(14,), dtype=np.float32)
 
         # Internal State
-        self.state = np.zeros(9, dtype=np.float32)
+        self.state = np.zeros(14, dtype=np.float32)
+        
+        # 辅助状态记忆
+        self.prev_ratios = np.zeros(3, dtype=np.float32)
+        self.est_delay_urllc = 0.0
+        self.shortfall_embb = 0.0
 
         # Initialize Queues (Data backlog in Megabits)
         # 队列初始值为0
         self.queues = np.zeros(3, dtype=np.float32)
 
+        # --- Channel Model Parameters (AR(1) 过程参数) ---
+        # eMBB, URLLC, mMTC 的信道均值
+        self.mean_se = np.array([4.5, 2.5, 1.75], dtype=np.float32)
+        self.current_se = self.mean_se.copy()
+        # 时间相关系数 rho (0~1)。越接近1，信道变化越平滑
+        self.rho_se = 0.9
+
         self.max_steps = 200
         self.current_step = 0
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed, options=options)
         self.current_step = 0
-        self.queues = np.zeros(3)  # Reset queues
+        self.queues = np.zeros(3, dtype=np.float32)  # Reset queues
+        # 重置信道状态为均值附近，防止每次环境重置信道都一模一样
+        self.current_se = self.mean_se + np.random.normal(0, 0.2, size=3)
         self._update_state()
         return self.state, {}
 
@@ -67,9 +86,13 @@ class FiveG_SLA_Env(gym.Env):
         self.current_step += 1
 
         # --- 1. Action Mapping (动作映射) ---
-        # Map [-1, 1] -> [0, 1] and Normalize
-        exp_action = np.exp(action)  # Softmax trick for positive ratios
-        ratios = exp_action / np.sum(exp_action)
+        # 弃用容易导致溢出和梯度消失的 np.exp (Softmax)
+        # 改用更稳定的线性映射：将 PPO 的 [-1, 1] 映射到 [0, 1]
+        action_positive = (action + 1.0) / 2.0
+        
+        # 设定极小值 0.01 防止除零并保证每个切片最少有一点点微弱控制信道带宽
+        weights = np.clip(action_positive, 0.01, 1.0)
+        ratios = weights / np.sum(weights)
 
         bw_allocated = ratios * self.total_bandwidth
 
@@ -101,47 +124,57 @@ class FiveG_SLA_Env(gym.Env):
         # Calculate Real-time Throughput (Mbps) for Reward
         achieved_throughput_mbps = served_mb / self.duration_tti
 
-        # --- 4. SLA Violation Check (SLA 违约检查) ---
+        # --- 4. Continuous SLA Violation Check (平滑违约检查) ---
+        # 弃用“非0即1”的悬崖式惩罚，改为连续的偏离度计算
         violations = np.zeros(3)
 
         # (1) eMBB: Check GBR
-        # If throughput < 100 Mbps, it's a violation
-        if achieved_throughput_mbps[0] < self.sla_props['embb_gbr']:
-            violations[0] = 1.0  # Boolean flag or margin
+        # 计算低于 GBR 的差值，并归一化
+        embb_shortfall = max(0.0, self.sla_props['embb_gbr'] - achieved_throughput_mbps[0])
+        violations[0] = embb_shortfall / self.sla_props['embb_gbr']
 
         # (2) URLLC: Check Latency (Little's Law approximation)
-        # Estimated Delay = Queue_Size (Mb) / Service_Rate (Mbps)
-        # Prevent division by zero
-        if service_rate_mbps[1] > 0:
-            est_delay = self.queues[1] / service_rate_mbps[1]
-        else:
-            est_delay = 1.0  # Infinite delay if no bandwidth
-
-        if est_delay > self.sla_props['urllc_max_delay']:
-            violations[1] = 1.0  # Violation!
+        # Prevent division by zero with a small floor value
+        safe_service_rate = max(service_rate_mbps[1], 0.1)
+        est_delay = self.queues[1] / safe_service_rate
+        
+        # 计算超出最大延迟的量，并归一化（超出2ms就算1.0）
+        delay_excess = max(0.0, est_delay - self.sla_props['urllc_max_delay'])
+        violations[1] = delay_excess / self.sla_props['urllc_max_delay']
 
         # (3) mMTC: Check Queue Overflow
+        queue_excess = max(0.0, self.queues[2] - self.sla_props['mmtc_max_queue'])
+        violations[2] = queue_excess / self.sla_props['mmtc_max_queue']
+        
+        # 物理约束：实际队列大小被限制在最大容量内（多出的包被丢弃）
         if self.queues[2] > self.sla_props['mmtc_max_queue']:
-            violations[2] = 1.0  # Buffer Overflow
-            self.queues[2] = self.sla_props['mmtc_max_queue']  # Drop packets
+            self.queues[2] = self.sla_props['mmtc_max_queue']
 
-        # --- 5. Reward Function (SLA-Aware) ---
+        # --- 5. Reward Function (SLA-Aware Smooth Penalty) ---
         # Base Reward: Total Throughput (encourages serving data)
         reward = np.sum(achieved_throughput_mbps) / 100.0  # Normalize
 
-        # Penalties: Heavy punishment for SLA violations
+        # Penalties: Continuous and scaled
         penalty_weight = 10.0
 
-        reward -= penalty_weight * violations[0]  # eMBB penalty
-        reward -= (penalty_weight * 2) * violations[1]  # URLLC penalty (Critical!)
-        reward -= penalty_weight * violations[2]  # mMTC penalty
+        # 对惩罚进行软截断 (Soft Clipping)，防止单个极端的恶劣状态导致梯度爆炸
+        # eMBB 最大扣除 50 分，URLLC 最大扣除 100 分
+        pen_embb = min(violations[0] * penalty_weight, penalty_weight * 5.0)
+        pen_urllc = min(violations[1] * (penalty_weight * 2.0), penalty_weight * 10.0)
+        pen_mmtc = min(violations[2] * penalty_weight, penalty_weight * 5.0)
+
+        reward -= (pen_embb + pen_urllc + pen_mmtc)
 
         # --- 6. Update State & Finish ---
         self._update_state()
 
-        # Update Observation with new queues
-        # State: [Arrivals(3), Queues(3), SE(3)]
+        # Update Observation with new queues and auxiliary features
+        # State mapping: 
+        # [Arrivals(0:3), Queues(3:6), SE(6:9), PrevRatios(9:12), EstDelay(12), Shortfall(13)]
         self.state[3:6] = self.queues
+        self.state[9:12] = ratios  # 记录当前动作给下一次状态用
+        self.state[12] = est_delay
+        self.state[13] = embb_shortfall
 
         terminated = self.current_step >= self.max_steps
         truncated = False
@@ -158,32 +191,40 @@ class FiveG_SLA_Env(gym.Env):
     def _update_state(self):
 
         # --- 1. eMBB: Video Streaming (Truncated Gaussian) ---
-        # 均值 60Mbps，标准差 10Mbps，最小 40，最大 90
-        # 这样 eMBB 自己就几乎把 80Mbps 的管道吃满了
-        arr_embb = np.clip(np.random.normal(60, 10), 40, 90)
+        # 100MHz 管道，SE均值4.5，满载约 450Mbps。
+        # 设定 eMBB 需求在 150~350 Mbps 之间波动
+        arr_embb = np.clip(np.random.normal(250, 40), 150, 350)
 
         # --- 2. URLLC: Industrial Automation (Poisson Burst) ---
-        # 模拟机器臂控制信号。平时很低，偶尔突发。
-        # 均值设为 10Mbps，但突发能到 30Mbps (占带宽的 30%!)
-        # Poisson 的 lambda 参数控制突发频率
-        if np.random.rand() > 0.8:  # 20% 概率突发
-            arr_urllc = np.random.normal(25, 5)  # 突发状态
+        # 模拟机器臂控制/自动驾驶。平时极低，罕见但剧烈的突发。
+        # 突发时可能需要瞬间消耗极大的带宽来保证 2ms 延迟
+        # 修改：加大突发烈度 (100 -> 150) 以彻底击穿静态分配的防御
+        if np.random.rand() > 0.9:  # 10% 概率突发 (降低频率，符合 URLLC 偶发特性)
+            arr_urllc = np.random.normal(150, 30)  # 极强突发状态，需求激增
         else:
-            arr_urllc = np.random.normal(5, 1)  # 静默状态
+            arr_urllc = np.random.normal(10, 2)  # 静默状态
 
         # --- 3. mMTC: Sensor Data (Constant + Noise) ---
-        # 几乎恒定，压力很小
-        arr_mmtc = np.random.normal(2, 0.1)
+        # 恒定且需求小，但对缓冲区溢出敏感
+        arr_mmtc = np.random.normal(10, 1)
 
         # --- 4. 物理信道 (Spectral Efficiency) ---
-        # 模拟典型的 Rayleigh 衰落或阴影衰落
-        # eMBB 用户通常在中心，SE 较高 (3-6)
-        se_embb = np.random.uniform(3.0, 6.0)
-        # URLLC 必须可靠，通常采用低 MCS 编码，所以有效 SE 较低 (1-3)
-        se_urllc = np.random.uniform(1.5, 3.5)
-        # mMTC 也是边缘设备，信号一般 (1-2)
-        se_mmtc = np.random.uniform(1.0, 2.5)
+        # 弃用纯随机数，改用 AR(1) 过程模拟真实的时间相关衰落信道 (Time-Correlated Fading Channel)
+        # 产生新的随机高斯波动 (innovation)
+        noise = np.array([
+            np.random.normal(0, 0.4),  # eMBB 的波动幅度
+            np.random.normal(0, 0.2),  # URLLC 的波动幅度
+            np.random.normal(0, 0.15)  # mMTC 的波动幅度
+        ])
+        
+        # AR(1) 演进公式: SE_t = rho * SE_{t-1} + (1 - rho) * Mean + sqrt(1 - rho^2) * Noise
+        self.current_se = (self.rho_se * self.current_se) + \
+                          ((1 - self.rho_se) * self.mean_se) + \
+                          (np.sqrt(1 - self.rho_se**2) * noise)
+                          
+        # 极值裁剪，保证物理意义 (SE 不能无限大，也不能过小)
+        self.current_se = np.clip(self.current_se, [2.0, 1.0, 0.5], [6.0, 4.0, 2.5])
 
         # 更新状态
         self.state[0:3] = [arr_embb, arr_urllc, arr_mmtc]
-        self.state[6:9] = [se_embb, se_urllc, se_mmtc]
+        self.state[6:9] = self.current_se

@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
@@ -13,52 +14,45 @@ N_TEST_STEPS = 2000
 
 
 # ==========================================
-# 1. 定义 Baseline Agents (针对拥塞场景优化)
+# 1. 定义 Baseline Agents (针对 100MHz 场景优化)
 # ==========================================
 
 class StaticAgent:
     """
-    静态分配 (针对 20MHz 拥塞场景优化):
-    资源极其有限。
-    策略：eMBB 60%, URLLC 35%, mMTC 5%
-    Action (Softmax前): [0.5, 0.0, -2.0]
+    静态分配 (针对 100MHz 宏站场景):
+    策略：eMBB 75%, URLLC 15%, mMTC 10%
+    注意：我们环境现在改用了线性裁剪映射: weights = clip((action + 1)/2, 0.01, 1.0)
+    所以如果要达到 0.75, 0.15, 0.10 的比例，
+    Action 对应的应该是 (weight * 2) - 1
+    Action: [0.5, -0.7, -0.8]
     """
 
     def predict(self, obs, deterministic=True):
-        return np.array([[0.5, 0.0, -2.0]]), None
+        return np.array([[0.5, -0.7, -0.8]]), None
 
 
 class HeuristicAgent:
     """
-    启发式代理 (V6 - 保守防御版):
-    痛点分析：之前的版本平时给 eMBB 太多(>80%)，导致 URLLC 潜伏期延迟积累。
-    修正策略：
-    1. 平时模式：向 Static 靠拢，给 URLLC 留足 30% (Static 是 35%)。
-    2. 紧急模式：比 Static 更强，给 URLLC 50% (Static 只有 35%)。
+    启发式代理 (改良版):
+    避免了原版“用力过猛”饿死 eMBB 的问题。
     """
+    def __init__(self, real_env):
+        self.real_env = real_env
 
     def predict(self, obs, deterministic=True):
-        urllc_queue = obs[0][4]
-
-        # 阈值极低：只要有一点点积压，马上切换，防止延迟累积
-        if urllc_queue > 0.005:
-            # --- 紧急模式 (Emergency) ---
-            # 目标：eMBB 45%, URLLC 50%, mMTC 5%
-            # Static 只有 35% 给 URLLC，我们给 50%，清空队列速度更快！
-            # eMBB 45% * 80Mbps = 36Mbps。
-            # 虽然稍微低于 40Mbps GBR，但因为只持续很短时间清队列，
-            # 平均下来 eMBB 速率可能还是达标的。这是为了救 URLLC 必须做的牺牲。
-            # Action: [-0.1, 0.0, -2.0]
-            # e^-0.1≈0.9, e^0=1.0 -> URLLC 占比 > eMBB
-            return np.array([[-0.1, 0.0, -2.0]]), None
+        urllc_queue = self.real_env.queues[1]
+        
+        # 提高阈值，不再神经过敏。只在积压超过 0.05Mb (约1个TTI的突发量) 时才启动紧急模式
+        if urllc_queue > 0.05:
+            # 紧急模式: 保证 eMBB 不死，给予 URLLC 足够的排空带宽
+            # eMBB 50%, URLLC 40%, mMTC 10%
+            # weights = [0.5, 0.4, 0.1]
+            return np.array([[0.0, -0.2, -0.8]]), None
         else:
-            # --- 平时模式 (Normal) ---
-            # 目标：eMBB 65%, URLLC 30%, mMTC 5%
-            # 之前的版本给 eMBB 85%，太激进了。
-            # 现在只比 Static (60%) 多拿 5% 的好处。
-            # Action: [0.8, 0.0, -2.0]
-            # e^0.8≈2.22, e^0=1.0 -> eMBB 占比 ≈ 68%
-            return np.array([[0.8, 0.0, -2.0]]), None
+            # 平时模式: URLLC 给足 10% 防护垫
+            # eMBB 80%, URLLC 10%, mMTC 10%
+            # weights = [0.8, 0.1, 0.1]
+            return np.array([[0.6, -0.8, -0.8]]), None
 
 
 # ==========================================
@@ -68,9 +62,11 @@ class HeuristicAgent:
 def evaluate_agent(agent_name, agent, env, steps, is_ppo=False):
     print(f"正在评估: {agent_name} ...")
 
-    # 强制重置环境和种子
-    env.seed(2025)
+    # 强制重置环境和种子，保证三种算法遇到的流量序列完全一致
+    env.seed(2026)
     obs = env.reset()
+    # 同时固定 Numpy 的全局种子，因为环境里的 np.random 会用到
+    np.random.seed(2026)
 
     total_throughput = 0.0
     total_violations = 0
@@ -84,42 +80,18 @@ def evaluate_agent(agent_name, agent, env, steps, is_ppo=False):
         info = infos[0]  # VecEnv 包了一层
 
         # --- 核心：提取真实物理指标 ---
-        # 我们不看 Reward，只看物理量，这样对比才公平
-
         # 1. 获取真实环境
         real_env = env.envs[0]
 
-        # 2. 计算 SLA 违约 (只要有任意一个切片违约，该时刻就算违约)
-        # info['violations'] 是 [1, 0, 0] 这种
-        if np.sum(info['violations']) > 0:
+        # 2. 计算 SLA 违约
+        # 新版环境的 violations 存的是连续归一化偏离度
+        # 只要有任何切片违约 (值 > 0.001 排除浮点误差)，就记作该时刻发生违约
+        if np.sum(info['violations']) > 0.001:
             total_violations += 1
 
         # 3. 计算实际总吞吐量 (Mbps)
-        # PPO 环境里把 throughput 放到了 info 吗？如果没有，我们就手动算
-        # 手动计算方法：
-        # eMBB Throughput (Mbps) = Served_Mb / 0.0005s (TTI)
-        # 简单起见，利用 real_env 内部状态
-        # (需要你在 env_5g_sla.py 的 info 里加了 'throughput'，如果没有，下面这行会报错)
-        # 如果你没加，请用下面被注释掉的代码手动算：
-
-        if 'throughput' in info:
-            total_throughput += info['throughput']
-        else:
-            # 手动补救计算 (Backup calculation)
-            # 反推 Action 比例
-            raw_action = action[0]
-            exp_a = np.exp(raw_action)
-            ratios = exp_a / np.sum(exp_a)
-            # 容量
-            se = real_env.state[6:9]
-            cap_mbps = (ratios * 20e6 * se) / 1e6
-            # 需求
-            demands = real_env.state[0:3]
-            # 实际流量 (min(capacity, demand + queue))
-            # 这里简化：近似等于 capacity (在拥塞时) 或 demand (在空闲时)
-            # 为准确起见，建议你在 env 文件里加 info['throughput']
-            # 这里暂且假设 env 里有，或者用 0 代替 (仅看违约率)
-            total_throughput += 0
+        # 我们已经在 env_5g_sla.py 里加了 'throughput'
+        total_throughput += info['throughput']
 
     avg_throughput = total_throughput / steps
     violation_rate = (total_violations / steps) * 100.0
@@ -150,11 +122,12 @@ def run_comparison():
         return FiveG_SLA_Env()
 
     env_base = DummyVecEnv([make_raw_env])
+    real_baseline_env = env_base.envs[0]  # <--- 在这里提取真实的基站环境对象
 
     # --- C. 加载 Agents ---
     ppo_agent = PPO.load(model_path, env=env_ppo)
     static_agent = StaticAgent()
-    heuristic_agent = HeuristicAgent()
+    heuristic_agent = HeuristicAgent(real_baseline_env)
 
     # --- D. 运行评估 ---
     # 注意：evaluate_agent 内部会固定 seed，保证流量一致
@@ -243,10 +216,15 @@ def plot_comparison(r_ppo, r_static, r_rule):
     # --- 6. 自动布局调整 (最重要的一步) ---
     # 这一行命令会让 matplotlib 自动计算所有元素的位置，防止遮挡
     # rect=[0, 0, 1, 0.95] 的意思是：图表只占用从底部到 95% 高度的空间，留出顶部 5% 给标题和图例
-    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
 
-    plt.savefig("./models_formal/final_comparison_auto.png", dpi=300)
-    print("自动排版对比图已保存至 ./models_formal/final_comparison_auto.png")
+    # --- 7. 保存到结果文件夹 ---
+    results_dir = "./results"
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+
+    plt.savefig(f"{results_dir}/final_comparison_auto.png", dpi=300)
+    print(f"自动排版对比图已保存至 {results_dir}/final_comparison_auto.png")
     plt.show()
 
 if __name__ == "__main__":
