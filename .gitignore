@@ -1,1 +1,32 @@
 .opencode
+
+# Python/Environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Ray & Reinforcement Learning Results
+ray_results/
+results/
+logs_formal/
+models_formal/
+tensorboard.log
+*.log
+
+# Checkpoints
+checkpoint_*/
+*.zip
+*.pkl
+
+# IDEs & Tools
+.vscode/
+.idea/
+.ruff_cache/
