@@ -227,13 +227,21 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
             if self.queues[agent][2] > self.sla_props['mmtc_max_queue']:
                 self.queues[agent][2] = self.sla_props['mmtc_max_queue']
 
+            
             # Reward calculation for this agent
             reward = np.sum(achieved_throughput_mbps) / 300.0  # Normalized to max ~1.0
             penalty_weight = 0.5
             pen_embb = min(violations[0] * penalty_weight, penalty_weight * 5.0)
-            pen_urllc = min(violations[1] * (penalty_weight * 3.0), penalty_weight * 10.0)
+            
+            # CLIFF PENALTY: Severe baseline punishment for any URLLC violation
+            if violations[1] > 0.0:
+                pen_urllc = 5.0 + min(violations[1] * (penalty_weight * 5.0), penalty_weight * 10.0)
+            else:
+                pen_urllc = 0.0
+                
             pen_mmtc = min(violations[2] * penalty_weight, penalty_weight * 5.0)
             reward -= (pen_embb + pen_urllc + pen_mmtc)
+
 
             agent_rewards[agent] = reward
 
@@ -272,7 +280,7 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
         avg_system_reward = total_system_reward / len(self.agents)
         
         # 合作比例: 0.5 * 本地奖励 + 0.5 * 全局平均奖励
-        alpha = 0.5
+        alpha = 0.7
         for agent in self.agents:
             if agent in agent_rewards:
                 rewards[agent] = alpha * agent_rewards[agent] + (1 - alpha) * avg_system_reward

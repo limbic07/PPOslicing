@@ -71,6 +71,7 @@ def run_baselines():
             policies={"shared_policy"},
             policy_mapping_fn=lambda agent_id, episode, **kwargs: "shared_policy",
         )
+        .rollouts(observation_filter="MeanStdFilter")
         .training(model={"fcnet_hiddens": [256, 256], "fcnet_activation": "relu"})
     )
     

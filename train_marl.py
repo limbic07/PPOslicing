@@ -54,21 +54,24 @@ def main():
             num_gpus_per_learner=1
         )
         .callbacks(SLACallbacks)
-        .training(
+                .training(
             gamma=0.99,
-            lr=5e-5,
+            lr=1e-4,  # Start with higher LR
+            lr_schedule=[[0, 1e-4], [500000, 1e-5]], # Linearly decay to 1e-5
             vf_loss_coeff=0.5,
-            clip_param=0.2,
-            entropy_coeff=0.01,
-            train_batch_size=4000,
-            sgd_minibatch_size=128,
+            clip_param=0.1,  # Tighter clip for stability
+            entropy_coeff=0.03, # Higher exploration early on
+            entropy_coeff_schedule=[[0, 0.05], [500000, 0.001]], # Anneal exploration
+            train_batch_size=2400,
+            sgd_minibatch_size=2048,
             model={"fcnet_hiddens": [256, 256], "fcnet_activation": "relu"},
             num_sgd_iter=10,
         )
         
         .rollouts(
-            num_rollout_workers=2,
-            num_envs_per_worker=1,
+            observation_filter="MeanStdFilter",
+            num_rollout_workers=6,
+            num_envs_per_worker=2,
             rollout_fragment_length=200,
         )
         .multi_agent(
@@ -85,9 +88,9 @@ def main():
     results = tune.run(
         "PPO",
         name="MAPPO_5G_Slicing",
-        stop={"training_iteration": 30},  # Train for 500 iterations
+        stop={"training_iteration": 40},  # Train for 500 iterations
         config=config.to_dict(),
-        checkpoint_freq=1,                # Checkpoint every 50 iterations
+        checkpoint_freq=10,                # Checkpoint every 50 iterations
         checkpoint_at_end=True,            # Save model at the end
         storage_path=os.path.abspath("./ray_results"),
     )
