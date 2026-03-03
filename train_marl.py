@@ -88,9 +88,9 @@ def main():
     results = tune.run(
         "PPO",
         name="MAPPO_5G_Slicing",
-        stop={"training_iteration": 40},  # Train for 500 iterations
+        stop={"training_iteration": 200},  # Train for 500 iterations
         config=config.to_dict(),
-        checkpoint_freq=10,                # Checkpoint every 50 iterations
+        checkpoint_freq=50,                # Checkpoint every 50 iterations
         checkpoint_at_end=True,            # Save model at the end
         storage_path=os.path.abspath("./ray_results"),
     )

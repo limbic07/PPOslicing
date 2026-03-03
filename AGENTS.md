@@ -148,3 +148,8 @@ flake8 . --max-line-length=120
 
 > **💡 后续优化方向 (Next Steps)**: 
 > 如果需要进一步加速收敛或降低后期的延迟小波动，可以在 `train_marl.py` 中尝试开启 `observation_filter="MeanStdFilter"`、加入学习率衰减 (LR Schedule)、或缩小 `clip_param` 至 0.1。
+
+---
+## 📄 项目架构修改详尽文档
+关于从 9D 到 14D 的具体维度定义、多小区 (Multi-Cell) 同频干扰 (ICI) 的计算公式、悬崖惩罚奖励函数 (Cliff Penalty) 设计以及 Ray 高性能并发训练的超参数配置，请参考我们在根目录下生成的最新技术文档：
+**👉 [PROJECT_UPDATES.md](./PROJECT_UPDATES.md)**
