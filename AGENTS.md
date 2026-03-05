@@ -6,8 +6,7 @@
 
 ## 分支边界（重要）
 - 本分支仅维护多智能体路线：`multi_cell_env.py`、`train_marl.py`、`test_marl.py`、`compare_marl_baseline.py`。
-- 不再维护单智能体 `stable-baselines3` 路线（Windows/conda）。
-- 不新增、不过度修改单智能体历史脚本；如需迁移，另开分支处理。
+- 不再维护archive中的单智能体 `stable-baselines3` 路线（Windows/conda）。
 
 ---
 
