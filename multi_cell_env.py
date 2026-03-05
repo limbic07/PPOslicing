@@ -61,7 +61,9 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
         self.urllc_warning_gain = float(self.config.get("urllc_warning_gain", 0.8))
         self.urllc_overflow_gain = float(self.config.get("urllc_overflow_gain", 3.0))
         self.urllc_exp_coeff = float(self.config.get("urllc_exp_coeff", 3.0))
-        self.urllc_penalty_cap_factor = float(self.config.get("urllc_penalty_cap_factor", 25.0))
+        self.urllc_penalty_cap_factor = float(self.config.get("urllc_penalty_cap_factor", 20.0))
+        self.embb_penalty_quad_gain = float(self.config.get("embb_penalty_quad_gain", 1.2))
+        self.embb_penalty_cap_factor = float(self.config.get("embb_penalty_cap_factor", 10.0))
         self.ici_gain = float(self.config.get("ici_gain", 0.6))
         self.se_modifier_floor = float(self.config.get("se_modifier_floor", 0.35))
         self.max_neighbors = 6.0
@@ -270,11 +272,14 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
             reward = np.sum(achieved_throughput_mbps) / 300.0  # Normalized throughput
 
             # Continuous smooth penalty with soft clipping (no hard step/cliff penalty).
-            raw_pen_embb = violations[0] * self.penalty_weight
+            embb_violation = float(violations[0])
+            raw_pen_embb = self.penalty_weight * (
+                embb_violation + self.embb_penalty_quad_gain * (embb_violation ** 2)
+            )
             raw_pen_urllc = self._urllc_soft_cliff_penalty(est_delay)
             raw_pen_mmtc = violations[2] * self.penalty_weight
 
-            pen_embb = self._soft_clip_penalty(raw_pen_embb, self.penalty_weight * 5.0)
+            pen_embb = self._soft_clip_penalty(raw_pen_embb, self.penalty_weight * self.embb_penalty_cap_factor)
             pen_urllc = self._soft_clip_penalty(raw_pen_urllc, self.penalty_weight * self.urllc_penalty_cap_factor)
             pen_mmtc = self._soft_clip_penalty(raw_pen_mmtc, self.penalty_weight * 5.0)
             reward -= (pen_embb + pen_urllc + pen_mmtc)
@@ -295,6 +300,7 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 "queue_sizes": self.queues[agent].copy(),
                 "violations": violations,
                 "throughput": np.sum(achieved_throughput_mbps),
+                "throughput_slices_mbps": achieved_throughput_mbps.astype(np.float32),
                 "est_urllc_delay": est_delay,
                 "urllc_delay_ratio": est_delay / self.sla_props["urllc_max_delay"],
                 "neighbor_prev_action_mean": self._get_neighbor_prev_action_mean(agent),

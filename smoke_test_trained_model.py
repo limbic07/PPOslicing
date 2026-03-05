@@ -20,12 +20,14 @@ TRAIN_SEEDS = [2026, 2027, 2028]
 EXPERIMENT_DIRS = [f"./ray_results/MAPPO_5G_Slicing_seed{seed}" for seed in TRAIN_SEEDS]
 ENV_CONFIG = {
     "penalty_weight": 0.7,
-    "urllc_warning_ratio": 0.5,
-    "urllc_softplus_slope": 16.0,
-    "urllc_warning_gain": 1.5,
-    "urllc_overflow_gain": 10.0,
-    "urllc_exp_coeff": 4.0,
-    "urllc_penalty_cap_factor": 40.0,
+    "urllc_warning_ratio": 0.65,
+    "urllc_softplus_slope": 12.0,
+    "urllc_warning_gain": 1.0,
+    "urllc_overflow_gain": 6.0,
+    "urllc_exp_coeff": 2.5,
+    "urllc_penalty_cap_factor": 20.0,
+    "embb_penalty_quad_gain": 1.2,
+    "embb_penalty_cap_factor": 10.0,
     "ici_gain": 0.65,
     "se_modifier_floor": 0.3,
 }
