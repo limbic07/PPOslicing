@@ -21,6 +21,12 @@ models_formal/
 tensorboard.log
 *.log
 
+# Legacy single-agent archive (MARL-only branch)
+archive/single_agent_legacy/
+
+# Local debug files
+cudatest.py
+
 # Checkpoints
 checkpoint_*/
 *.zip
@@ -30,3 +36,4 @@ checkpoint_*/
 .vscode/
 .idea/
 .ruff_cache/
+__pycache__/env_5g_sla.cpython-312.pyc
