@@ -23,7 +23,7 @@ python train_marl.py
 ```
 - 当前默认等价于：
 ```bash
-python train_marl.py --mode full --hw-profile balanced --env-profile balanced --observation-mode pure_local
+python train_marl.py --mode full --hw-profile balanced --env-profile balanced --algo-mode ippo --observation-mode pure_local
 ```
 - 默认训练计划：`full + balanced(hw) + balanced(env) + pure_local(IPPO) + seed=[2026] + 200 iterations`。
 - 常用切换：
@@ -32,6 +32,8 @@ python train_marl.py --mode quick
 python train_marl.py --mode full --env-profile harsh
 python train_marl.py --mode full --observation-mode pure_local
 python train_marl.py --mode full --observation-mode neighbor_augmented
+python train_marl.py --mode full --algo-mode mappo
+python train_marl.py --mode full --observation-mode neighbor_augmented --use-centralized-critic
 python train_marl.py --mode full --seeds 2026 2027 2028
 python train_marl.py --mode full --hw-profile maxperf
 python train_marl.py --mode full --iters 120
@@ -132,7 +134,13 @@ flake8 . --max-line-length=120
 - 当前基础路线是 **纯本地 IPPO（pure_local）**：
   - 无全局状态（global state）
   - 无邻居观测（neighbor information）
-  - `cooperative_alpha = 1.0`，纯本地 reward
+  - 作为 baseline 训练时固定 `cooperative_alpha = 1.0`（纯本地奖励）
+- 已支持可选 **CTDE（MAPPO-style）** 开关：
+  - 推荐通过 `--algo-mode mappo` 启用（会自动启用 `neighbor_augmented + centralized critic`）
+  - 也可手工使用 `--observation-mode neighbor_augmented --use-centralized-critic`
+  - `MAPPO` 训练时固定 `cooperative_alpha = 0.7`（局部+全局均值混合）
+  - 协作项采用“邻居定向 + 邻居求和”（不使用反事实/差分奖励）
+  - actor 仅使用本地观测，critic 使用集中上下文特征
 - `neighbor_augmented` 仅作为后续从 IPPO 走向更强协同方法的过渡模式，不作为当前默认主线。
 
 ### 3.6 奖励函数（Reward Function）
@@ -151,7 +159,8 @@ flake8 . --max-line-length=120
   - `mmtc_penalty_cap_factor=5.0`
   - `embb_violation_cap=2.0, urllc_violation_cap=5.0, mmtc_violation_cap=2.0`
 - `balanced` 环境下，训练奖励改为 binary SLA reward：
-  - `cooperative_alpha = 1.0`
+  - profile 默认 `cooperative_alpha = 0.7`
+  - 训练模式隔离：`IPPO -> cooperative_alpha=1.0`，`MAPPO -> cooperative_alpha=0.7`
   - `binary_reward_throughput_scale = 80.0`
   - `binary_penalty_embb/urllc/mmtc = 4 / 6 / 4`
   - `binary_urllc_yellow_start_ratio = 0.5`（1ms 黄灯起点，2ms 红线）
@@ -208,6 +217,8 @@ flake8 . --max-line-length=120
   - `balanced + pure_local -> balanced_ippo_v1`
   - `harsh + neighbor_augmented -> harsh_neighbor_v4`
   - `balanced + neighbor_augmented -> balanced_neighbor_v6`
+  - `harsh + neighbor_augmented + CTDE -> harsh_mappo_ctde_v1`
+  - `balanced + neighbor_augmented + CTDE -> balanced_mappo_ctde_v1`
 - `quick` / `full` 训练都使用 `MeanStdFilter`，不再使用 `NoFilter`。
 
 ---
@@ -219,8 +230,8 @@ flake8 . --max-line-length=120
 - `Priority Heuristic`
 - `Max-Weight`
 - `Proportional Fair`
-- `Max-Throughput (Upper Bound)`
-- `IPPO (pure_local)`
+- `IPPO (Baseline, pure_local)`
+- `MAPPO (Proposed, CTDE)`
 
 ### 5.2 Seed 划分
 - 训练 seed：`[2026, 2027, 2028]`（用于 checkpoint 池）。
@@ -236,7 +247,7 @@ flake8 . --max-line-length=120
   - Jain Fairness Index（eMBB 累计吞吐）
   - SLA success rate（system + BS_0）
   - Penalty 绝对值与占比（含 raw/clipped 分解）
-  - IPPO 推理开销：total/per-agent/p95（ms）
+  - IPPO / MAPPO 推理开销：total/per-agent/p95（ms）
 
 ### 5.4 Checkpoint 选择
 - 使用 `checkpoint_utils.rank_checkpoints_by_metric()`：

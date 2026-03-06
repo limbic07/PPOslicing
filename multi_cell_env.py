@@ -5,7 +5,7 @@ from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from gymnasium import spaces
 from gymnasium.utils.seeding import np_random
 
-from ippo_rl_module import DEFAULT_INITIAL_SLICE_RATIOS
+from ippo_rl_module import CENTRALIZED_CRITIC_GLOBAL_DIM, DEFAULT_INITIAL_SLICE_RATIOS
 
 class MultiCell_5G_SLA_Env(MultiAgentEnv):
     """
@@ -69,6 +69,25 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
         self.cooperative_alpha = float(cfg_value("cooperative_alpha", 0.7))
         self.action_softmax_temperature = float(cfg_value("action_softmax_temperature", 3.0))
         self.observation_mode = str(cfg_value("observation_mode", "pure_local")).lower()
+        self.use_centralized_critic = bool(cfg_value("use_centralized_critic", False))
+        self.centralized_critic_global_dim = int(
+            cfg_value("centralized_critic_global_dim", CENTRALIZED_CRITIC_GLOBAL_DIM)
+        )
+        self.neighbor_coop_gain = float(cfg_value("neighbor_coop_gain", 4.0))
+        if self.neighbor_coop_gain < 0.0:
+            raise ValueError("neighbor_coop_gain must be >= 0")
+        self.expected_centralized_critic_global_dim = self.num_cells * 12
+        if (
+            self.use_centralized_critic
+            and self.centralized_critic_global_dim != self.expected_centralized_critic_global_dim
+        ):
+            raise ValueError(
+                "centralized_critic_global_dim must match flattened global feature size: "
+                f"{self.expected_centralized_critic_global_dim} (num_cells={self.num_cells}, per_cell=12). "
+                f"Got {self.centralized_critic_global_dim}."
+            )
+        if self.centralized_critic_global_dim < 0:
+            raise ValueError("centralized_critic_global_dim must be >= 0")
         if self.action_softmax_temperature <= 0.0:
             raise ValueError("action_softmax_temperature must be > 0")
         if self.observation_mode not in {"pure_local", "neighbor_augmented"}:
@@ -140,7 +159,9 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
         self._agent_action_space = spaces.Box(
             low=np.float32(-1.0), high=np.float32(1.0), shape=(3,), dtype=np.float32
         )
-        self.obs_dim = 14 if self.observation_mode == "pure_local" else 20
+        self.local_obs_dim = 14 if self.observation_mode == "pure_local" else 20
+        critic_context_dim = self.centralized_critic_global_dim if self.use_centralized_critic else 0
+        self.obs_dim = self.local_obs_dim + critic_context_dim
         self._agent_observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
         )
@@ -170,6 +191,7 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 "embb_sla_window_tti": 1,
                 "reward_mode": "tail_risk_coop",
                 "cooperative_alpha": 0.7,
+                "neighbor_coop_gain": 2.0,
                 "action_softmax_temperature": 3.0,
                 "urllc_burst_start_prob": 0.05,
                 "urllc_burst_end_prob": 0.2,
@@ -187,7 +209,8 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 "embb_gbr": 220.0,
                 "embb_sla_window_tti": 8,
                 "reward_mode": "binary_sla_reward",
-                "cooperative_alpha": 1.0,
+                "cooperative_alpha": 0.7,
+                "neighbor_coop_gain": 4.0,
                 "action_softmax_temperature": 3.0,
                 "urllc_burst_start_prob": 0.06,
                 "urllc_burst_end_prob": 0.35,
@@ -624,16 +647,34 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 ),
             }
 
-        # --- Cooperative Reward (MARL) ---
-        # Agent reward is local reward + average reward of system
-        total_system_reward = sum(agent_rewards.values())
-        avg_system_reward = total_system_reward / len(self.agents)
-        
-        # 合作比例: 0.5 * 本地奖励 + 0.5 * 全局平均奖励
+        # --- Neighbor-Directed Cooperative Reward (MARL) ---
+        # Reward_i = alpha * local_i + (1-alpha) * sum_j(c_ij * local_j)
+        # c_ij is directional coupling from i -> j (urgency-aware + ICI-aware).
         alpha = self.cooperative_alpha
         for agent in self.agents:
             if agent in agent_rewards:
-                rewards[agent] = alpha * agent_rewards[agent] + (1 - alpha) * avg_system_reward
+                neighbor_directed_sum = 0.0
+                neighbor_weight_sum = 0.0
+                source_ratios = ratios_dict.get(agent, self.state[agent][9:12])
+                for neighbor in self.neighbor_map.get(agent, []):
+                    if neighbor not in agent_rewards or neighbor not in infos:
+                        continue
+                    coupling = self._compute_neighbor_directional_coupling(
+                        source_agent=agent,
+                        target_agent=neighbor,
+                        source_ratios=source_ratios,
+                        target_info=infos[neighbor],
+                    )
+                    neighbor_directed_sum += coupling * agent_rewards[neighbor]
+                    neighbor_weight_sum += coupling
+
+                reward_local_component = alpha * agent_rewards[agent]
+                reward_neighbor_component = (1 - alpha) * neighbor_directed_sum
+                rewards[agent] = reward_local_component + reward_neighbor_component
+                infos[agent]["neighbor_coop_term"] = np.float32(neighbor_directed_sum)
+                infos[agent]["neighbor_coop_weight_sum"] = np.float32(neighbor_weight_sum)
+                infos[agent]["reward_local_component"] = np.float32(reward_local_component)
+                infos[agent]["reward_neighbor_component"] = np.float32(reward_neighbor_component)
 
         # Done flags
         terminateds = {"__all__": self.current_step >= self.max_steps}
@@ -710,13 +751,85 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
             dtype=np.float32,
         )
 
+    def _get_target_slice_urgency(self, target_info):
+        violations_raw = np.asarray(target_info.get("violations_raw", np.zeros(3, dtype=np.float32)), dtype=np.float32)
+        urllc_delay_ratio = float(max(target_info.get("urllc_delay_ratio", 0.0), 0.0))
+        yellow_start = float(np.clip(self.binary_urllc_yellow_start_ratio, 0.0, 0.999999))
+        urllc_yellow_progress = float(
+            np.clip((urllc_delay_ratio - yellow_start) / max(1.0 - yellow_start, 1e-6), 0.0, 1.0)
+        )
+        stress = np.array(
+            [
+                max(float(violations_raw[0]), 0.0),
+                max(float(violations_raw[1]), urllc_yellow_progress),
+                max(float(violations_raw[2]), 0.0),
+            ],
+            dtype=np.float32,
+        )
+        stress_sum = float(np.sum(stress))
+        if stress_sum <= 1e-8:
+            return np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)
+        return (stress / stress_sum).astype(np.float32)
+
+    def _neighbor_normalizer_for_target(self, target_agent):
+        if self.interference_neighbor_normalization == "actual_neighbors":
+            return max(float(len(self.neighbor_map.get(target_agent, []))), 1.0)
+        if self.interference_neighbor_normalization == "fixed_max":
+            return max(float(self.max_neighbors), 1.0)
+        raise ValueError(
+            "Unsupported interference_neighbor_normalization="
+            f"{self.interference_neighbor_normalization!r}"
+        )
+
+    def _compute_neighbor_directional_coupling(self, source_agent, target_agent, source_ratios, target_info):
+        if source_agent not in self.neighbor_map.get(target_agent, []):
+            return 0.0
+
+        source_ratios = np.asarray(source_ratios, dtype=np.float32)
+        urgency = self._get_target_slice_urgency(target_info)
+        normalizer = self._neighbor_normalizer_for_target(target_agent)
+
+        # Directional ICI contribution from source -> target for each slice.
+        directional_slice_load = (self.ici_gain * source_ratios) / normalizer
+        coupling = float(np.dot(directional_slice_load, urgency))
+        return max(coupling, 0.0) * float(self.neighbor_coop_gain)
+
     def _build_obs(self, agent):
         if self.observation_mode == "pure_local":
-            obs = np.zeros(14, dtype=np.float32)
-            obs[0:14] = self.state[agent]
+            local_obs = np.zeros(14, dtype=np.float32)
+            local_obs[0:14] = self.state[agent]
         else:
-            obs = np.zeros(20, dtype=np.float32)
-            obs[0:14] = self.state[agent]
-            obs[14:17] = self._get_neighbor_prev_action_mean(agent)
-            obs[17:20] = self._get_neighbor_urgency_features(agent)
+            local_obs = np.zeros(20, dtype=np.float32)
+            local_obs[0:14] = self.state[agent]
+            local_obs[14:17] = self._get_neighbor_prev_action_mean(agent)
+            local_obs[17:20] = self._get_neighbor_urgency_features(agent)
+
+        if not self.use_centralized_critic:
+            return np.nan_to_num(local_obs, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
+
+        global_ctx = self._get_centralized_critic_global_features()
+        obs = np.zeros(self.obs_dim, dtype=np.float32)
+        obs[: self.local_obs_dim] = local_obs
+        obs[self.local_obs_dim :] = global_ctx
         return np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
+
+    def _get_centralized_critic_global_features(self):
+        # Preserve spatial topology: flatten per-cell features in fixed BS order.
+        per_cell_features = []
+        for agent in self.agents:
+            per_cell_features.extend(
+                [
+                    self.state[agent][0:3],      # demand/arrivals
+                    self.queues[agent],          # current queue sizes
+                    self.current_se[agent],      # current SE
+                    self.state[agent][9:12],     # previous action ratios
+                ]
+            )
+        features = np.concatenate(per_cell_features, axis=0).astype(np.float32)
+
+        if features.size != self.centralized_critic_global_dim:
+            raise ValueError(
+                "Flattened centralized critic feature size mismatch. "
+                f"expected={self.centralized_critic_global_dim}, got={features.size}"
+            )
+        return features

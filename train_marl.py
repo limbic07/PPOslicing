@@ -13,6 +13,7 @@ from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from ray.tune.registry import register_env
 
 from ippo_rl_module import (
+    CENTRALIZED_CRITIC_GLOBAL_DIM,
     DEFAULT_INITIAL_ACTION_LOG_STD,
     DEFAULT_INITIAL_SLICE_RATIOS,
     build_initialized_rl_module_spec,
@@ -42,9 +43,15 @@ EXPERIMENT_ENV_TAGS = {
     ("harsh", "neighbor_augmented"): "harsh_neighbor_v4",
     ("balanced", "neighbor_augmented"): "balanced_neighbor_v6",
 }
+EXPERIMENT_CTDE_ENV_TAGS = {
+    ("harsh", "neighbor_augmented"): "harsh_mappo_ctde_v1",
+    ("balanced", "neighbor_augmented"): "balanced_mappo_ctde_v1",
+}
 ENV_CONFIG = {
     "env_profile": DEFAULT_ENV_PROFILE,
     "observation_mode": DEFAULT_OBSERVATION_MODE,
+    "use_centralized_critic": False,
+    "centralized_critic_global_dim": CENTRALIZED_CRITIC_GLOBAL_DIM,
     "action_softmax_temperature": 3.0,
     # P1 tail-risk shaping: lighter blanket pressure, stronger punishment near/after URLLC deadline.
     "penalty_weight": 0.7,
@@ -174,6 +181,10 @@ class SLACallbacks(DefaultCallbacks):
             "local_reward",
             "local_reward_unclipped",
             "role_reward_scale",
+            "reward_local_component",
+            "reward_neighbor_component",
+            "neighbor_coop_term",
+            "neighbor_coop_weight_sum",
             "penalty_total",
             "penalty_embb",
             "penalty_urllc",
@@ -307,6 +318,9 @@ def build_config(seed, num_learners, num_gpus_per_learner, hw_cfg, env_config):
                 fcnet_activation="relu",
                 initial_action_ratios=INITIAL_ACTION_RATIOS,
                 initial_action_log_std=INITIAL_ACTION_LOG_STD,
+                observation_mode=env_config["observation_mode"],
+                use_centralized_critic=bool(env_config.get("use_centralized_critic", False)),
+                critic_global_dim=int(env_config.get("centralized_critic_global_dim", CENTRALIZED_CRITIC_GLOBAL_DIM)),
             )
         )
         .training(
@@ -340,8 +354,16 @@ def build_config(seed, num_learners, num_gpus_per_learner, hw_cfg, env_config):
     )
 
 
-def get_experiment_env_tag(env_profile: str, observation_mode: str) -> str:
+def get_experiment_env_tag(env_profile: str, observation_mode: str, use_centralized_critic: bool) -> str:
     key = (env_profile, observation_mode)
+    if use_centralized_critic:
+        if key not in EXPERIMENT_CTDE_ENV_TAGS:
+            raise ValueError(
+                "CTDE requires neighbor_augmented observation mode with a supported env profile. "
+                f"Got env_profile={env_profile!r}, observation_mode={observation_mode!r}"
+            )
+        return EXPERIMENT_CTDE_ENV_TAGS[key]
+
     if key not in EXPERIMENT_ENV_TAGS:
         raise ValueError(
             "Unsupported experiment tagging combination: "
@@ -354,6 +376,15 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Train MARL with quick/full profiles. "
         "Use quick during early debugging, full for final reporting."
+    )
+    parser.add_argument(
+        "--algo-mode",
+        choices=["ippo", "mappo"],
+        default="ippo",
+        help=(
+            "ippo: current local baseline. "
+            "mappo: CTDE mode (neighbor_augmented + centralized critic)."
+        ),
     )
     parser.add_argument(
         "--mode",
@@ -395,6 +426,11 @@ def parse_args():
         default=DEFAULT_OBSERVATION_MODE,
         help="Observation mode. pure_local is the fully local IPPO baseline.",
     )
+    parser.add_argument(
+        "--use-centralized-critic",
+        action="store_true",
+        help="Enable CTDE: actor uses local observations, critic uses centralized context.",
+    )
     return parser.parse_args()
 
 
@@ -417,9 +453,38 @@ def resolve_train_plan(args):
     return seeds, train_iters
 
 
+def resolve_algorithm_mode(args):
+    observation_mode = args.observation_mode
+    use_centralized_critic = bool(args.use_centralized_critic)
+    cooperative_alpha = 1.0
+
+    if args.algo_mode == "mappo":
+        if observation_mode != "neighbor_augmented":
+            print(
+                "algo_mode=mappo requires observation_mode=neighbor_augmented; "
+                f"overriding from {observation_mode} to neighbor_augmented."
+            )
+        observation_mode = "neighbor_augmented"
+        use_centralized_critic = True
+        cooperative_alpha = 0.7
+
+    if args.algo_mode == "ippo" and use_centralized_critic:
+        raise ValueError(
+            "algo_mode=ippo is defined as local baseline. "
+            "Disable --use-centralized-critic or switch --algo-mode mappo."
+        )
+
+    return observation_mode, use_centralized_critic, cooperative_alpha
+
+
 def main():
     args = parse_args()
     seeds, train_iters = resolve_train_plan(args)
+    (
+        resolved_observation_mode,
+        resolved_use_centralized_critic,
+        resolved_cooperative_alpha,
+    ) = resolve_algorithm_mode(args)
     hw_cfg = resolve_hw_profile(args.hw_profile, args.mode)
 
     # Initialize Ray
@@ -439,14 +504,24 @@ def main():
         f"train_batch_floor={hw_cfg['train_batch_floor']}, "
         f"mini_batch={hw_cfg['mini_batch_size_per_learner']}, "
         f"num_sgd_iter={hw_cfg['num_sgd_iter']}, "
-        f"observation_filter={hw_cfg['observation_filter']}"
+        f"observation_filter={hw_cfg['observation_filter']}, "
+        f"algo_mode={args.algo_mode}, "
+        f"observation_mode={resolved_observation_mode}, "
+        f"use_centralized_critic={resolved_use_centralized_critic}, "
+        f"cooperative_alpha={resolved_cooperative_alpha}"
     )
 
     # Use Tune for multi-seed training orchestration
     env_config = dict(ENV_CONFIG)
     env_config["env_profile"] = args.env_profile
-    env_config["observation_mode"] = args.observation_mode
-    experiment_env_tag = get_experiment_env_tag(args.env_profile, args.observation_mode)
+    env_config["observation_mode"] = resolved_observation_mode
+    env_config["use_centralized_critic"] = resolved_use_centralized_critic
+    env_config["cooperative_alpha"] = float(resolved_cooperative_alpha)
+    experiment_env_tag = get_experiment_env_tag(
+        args.env_profile,
+        resolved_observation_mode,
+        resolved_use_centralized_critic,
+    )
     for seed in seeds:
         config = build_config(seed, num_learners, num_gpus_per_learner, hw_cfg, env_config)
         experiment_name = f"{EXPERIMENT_PREFIX}_{experiment_env_tag}_seed{seed}"
@@ -454,7 +529,10 @@ def main():
             "Starting MARL training "
             f"(seed={seed}, new_api_stack=True, num_learners={num_learners}, "
             f"num_gpus_per_learner={num_gpus_per_learner}, env_profile={args.env_profile}, "
-            f"observation_mode={args.observation_mode}, "
+            f"algo_mode={args.algo_mode}, "
+            f"observation_mode={resolved_observation_mode}, "
+            f"use_centralized_critic={resolved_use_centralized_critic}, "
+            f"cooperative_alpha={resolved_cooperative_alpha}, "
             f"experiment_env_tag={experiment_env_tag}, "
             f"name={experiment_name})..."
         )

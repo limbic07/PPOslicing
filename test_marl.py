@@ -12,6 +12,7 @@ from ray.tune.registry import register_env
 
 from checkpoint_utils import rank_checkpoints_by_metric
 from ippo_rl_module import (
+    CENTRALIZED_CRITIC_GLOBAL_DIM,
     DEFAULT_INITIAL_ACTION_LOG_STD,
     DEFAULT_INITIAL_SLICE_RATIOS,
     build_initialized_rl_module_spec,
@@ -29,13 +30,25 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 EVAL_SEED = 2026
 TRAIN_SEEDS = [2026, 2027, 2028]
 ENV_PROFILE = "balanced"
-OBSERVATION_MODE = "pure_local"
-EXPERIMENT_ENV_TAG = "balanced_ippo_v1"
+ALGO_MODE = "ippo"  # ippo | mappo
+if ALGO_MODE == "mappo":
+    OBSERVATION_MODE = "neighbor_augmented"
+    USE_CENTRALIZED_CRITIC = True
+    COOPERATIVE_ALPHA = 0.7
+    EXPERIMENT_ENV_TAG = "balanced_mappo_ctde_v1"
+else:
+    OBSERVATION_MODE = "pure_local"
+    USE_CENTRALIZED_CRITIC = False
+    COOPERATIVE_ALPHA = 1.0
+    EXPERIMENT_ENV_TAG = "balanced_ippo_v1"
 MIN_BEST_CHECKPOINT_ITER = 50
 EXPERIMENT_DIRS = [f"./ray_results/MAPPO_5G_Slicing_{EXPERIMENT_ENV_TAG}_seed{seed}" for seed in TRAIN_SEEDS]
 ENV_CONFIG = {
     "env_profile": ENV_PROFILE,
     "observation_mode": OBSERVATION_MODE,
+    "use_centralized_critic": USE_CENTRALIZED_CRITIC,
+    "cooperative_alpha": COOPERATIVE_ALPHA,
+    "centralized_critic_global_dim": CENTRALIZED_CRITIC_GLOBAL_DIM,
     "action_softmax_temperature": 3.0,
     "penalty_weight": 0.7,
     "w_embb": 1.0,
@@ -112,6 +125,9 @@ def run_test():
                 fcnet_activation="relu",
                 initial_action_ratios=DEFAULT_INITIAL_SLICE_RATIOS,
                 initial_action_log_std=DEFAULT_INITIAL_ACTION_LOG_STD,
+                observation_mode=ENV_CONFIG["observation_mode"],
+                use_centralized_critic=bool(ENV_CONFIG.get("use_centralized_critic", False)),
+                critic_global_dim=int(ENV_CONFIG.get("centralized_critic_global_dim", CENTRALIZED_CRITIC_GLOBAL_DIM)),
             )
         )
         .multi_agent(

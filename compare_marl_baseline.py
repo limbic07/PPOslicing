@@ -15,6 +15,7 @@ from ray.tune.registry import register_env
 
 from checkpoint_utils import rank_checkpoints_by_metric
 from ippo_rl_module import (
+    CENTRALIZED_CRITIC_GLOBAL_DIM,
     DEFAULT_INITIAL_ACTION_LOG_STD,
     DEFAULT_INITIAL_SLICE_RATIOS,
     build_initialized_rl_module_spec,
@@ -31,17 +32,35 @@ ROLLOUT_STEPS = 200
 TRAIN_SEEDS = [2026, 2027, 2028]
 EVAL_SEEDS = [3026, 3027, 3028, 3029]
 ENV_PROFILE = "balanced"
-OBSERVATION_MODE = "pure_local"
-EXPERIMENT_ENV_TAG = "balanced_ippo_v1"
 MIN_EVAL_CHECKPOINT_ITER = 50
-IPPO_EXPERIMENT_DIRS = [f"./ray_results/MAPPO_5G_Slicing_{EXPERIMENT_ENV_TAG}_seed{seed}" for seed in TRAIN_SEEDS]
+
+LEARNED_METHODS = [
+    {
+        "algo_key": "ippo",
+        "label": "IPPO (Baseline, pure_local)",
+        "experiment_env_tag": "balanced_ippo_v1",
+        "observation_mode": "pure_local",
+        "use_centralized_critic": False,
+        "cooperative_alpha": 1.0,
+    },
+    {
+        "algo_key": "mappo",
+        "label": "MAPPO (Proposed, CTDE)",
+        "experiment_env_tag": "balanced_mappo_ctde_v1",
+        "observation_mode": "neighbor_augmented",
+        "use_centralized_critic": True,
+        "cooperative_alpha": 0.7,
+    },
+]
+LEARNED_METHOD_BY_KEY = {item["algo_key"]: item for item in LEARNED_METHODS}
 
 ALGORITHMS = [
     ("static", "Static SLA Split"),
     ("priority", "Priority Heuristic"),
     ("max_weight", "Max-Weight (Throughput-Oriented Heuristic)"),
     ("pf", "Proportional Fair"),
-    ("ippo", "IPPO (pure_local)"),
+    ("ippo", LEARNED_METHOD_BY_KEY["ippo"]["label"]),
+    ("mappo", LEARNED_METHOD_BY_KEY["mappo"]["label"]),
 ]
 
 PLOT_COLORS = {
@@ -50,11 +69,11 @@ PLOT_COLORS = {
     "max_weight": "#2ca02c",
     "pf": "#d62728",
     "ippo": "#9467bd",
+    "mappo": "#8c564b",
 }
 
-ENV_CONFIG = {
+BASE_ENV_CONFIG = {
     "env_profile": ENV_PROFILE,
-    "observation_mode": OBSERVATION_MODE,
     "action_softmax_temperature": 3.0,
     "penalty_weight": 0.7,
     "w_embb": 1.0,
@@ -92,8 +111,34 @@ ENV_CONFIG = {
     "reward_clip_abs": 0.0,
 }
 
+HEURISTIC_ENV_CONFIG = {
+    **BASE_ENV_CONFIG,
+    "observation_mode": "pure_local",
+    "use_centralized_critic": False,
+    "cooperative_alpha": 0.7,
+}
+
+LEARNED_ENV_CONFIGS = {
+    method["algo_key"]: {
+        **BASE_ENV_CONFIG,
+        "observation_mode": method["observation_mode"],
+        "use_centralized_critic": method["use_centralized_critic"],
+        "cooperative_alpha": method["cooperative_alpha"],
+        "centralized_critic_global_dim": CENTRALIZED_CRITIC_GLOBAL_DIM,
+    }
+    for method in LEARNED_METHODS
+}
+
+LEARNED_EXPERIMENT_DIRS = {
+    method["algo_key"]: [
+        f"./ray_results/MAPPO_5G_Slicing_{method['experiment_env_tag']}_seed{seed}"
+        for seed in TRAIN_SEEDS
+    ]
+    for method in LEARNED_METHODS
+}
+
 DEFAULT_OBSERVATION_FILTER = "MeanStdFilter"
-IPPO_EVALUATORS = []
+LEARNED_EVALUATORS = {item["algo_key"]: [] for item in LEARNED_METHODS}
 
 
 def validate_seed_split():
@@ -214,20 +259,23 @@ def _resolve_trial_observation_filter(trial_dir: str | None) -> str:
     return str(observation_filter)
 
 
-def build_ippo_eval_algo(observation_filter: str):
+def build_learned_eval_algo(observation_filter: str, env_config: dict):
     config = (
         PPOConfig()
-        .environment("MultiCell_5G_SLA_Env", env_config=ENV_CONFIG)
+        .environment("MultiCell_5G_SLA_Env", env_config=env_config)
         .framework("torch")
         .api_stack(enable_rl_module_and_learner=True, enable_env_runner_and_connector_v2=True)
         .debugging(seed=EVAL_SEEDS[0])
         .rl_module(
             rl_module_spec=build_initialized_rl_module_spec(
-                ENV_CONFIG["action_softmax_temperature"],
+                env_config["action_softmax_temperature"],
                 fcnet_hiddens=[256, 256],
                 fcnet_activation="relu",
                 initial_action_ratios=DEFAULT_INITIAL_SLICE_RATIOS,
                 initial_action_log_std=DEFAULT_INITIAL_ACTION_LOG_STD,
+                observation_mode=env_config["observation_mode"],
+                use_centralized_critic=bool(env_config.get("use_centralized_critic", False)),
+                critic_global_dim=int(env_config.get("centralized_critic_global_dim", CENTRALIZED_CRITIC_GLOBAL_DIM)),
             )
         )
         .multi_agent(
@@ -240,124 +288,137 @@ def build_ippo_eval_algo(observation_filter: str):
     return config.build()
 
 
-def stop_ippo_evaluators():
-    global IPPO_EVALUATORS
+def stop_learned_evaluators():
+    global LEARNED_EVALUATORS
 
-    for evaluator in IPPO_EVALUATORS:
-        evaluator["algo"].stop()
-    IPPO_EVALUATORS = []
+    for evaluators in LEARNED_EVALUATORS.values():
+        for evaluator in evaluators:
+            evaluator["algo"].stop()
+    LEARNED_EVALUATORS = {item["algo_key"]: [] for item in LEARNED_METHODS}
 
 
-def init_ippo_evaluators():
-    global IPPO_EVALUATORS
+def init_learned_evaluators():
+    global LEARNED_EVALUATORS
 
-    stop_ippo_evaluators()
+    stop_learned_evaluators()
 
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
 
-    evaluators = []
+    evaluators_by_algo = {item["algo_key"]: [] for item in LEARNED_METHODS}
     restore_errors = []
 
-    for train_seed, experiment_dir in zip(TRAIN_SEEDS, IPPO_EXPERIMENT_DIRS):
-        ranked_checkpoints = rank_checkpoints_by_metric(
-            experiment_dir,
-            min_training_iteration=MIN_EVAL_CHECKPOINT_ITER,
-            fallback_to_any=False,
-        )
-        if not ranked_checkpoints:
-            restore_errors.append(
-                f"train_seed={train_seed}, experiment_dir={experiment_dir} -> "
-                f"no ranked checkpoint found with iter>={MIN_EVAL_CHECKPOINT_ITER}"
-            )
-            continue
+    for method in LEARNED_METHODS:
+        algo_key = method["algo_key"]
+        experiment_dirs = LEARNED_EXPERIMENT_DIRS[algo_key]
+        env_config = LEARNED_ENV_CONFIGS[algo_key]
+        method_label = method["label"]
 
-        restored = False
-        for item in ranked_checkpoints:
-            checkpoint_path = item["checkpoint_path"]
-            score = item.get("episode_return_mean")
-            iteration = item.get("training_iteration")
-            urllc_violation = item.get("center_urllc_violations")
-            embb_violation = item.get("center_embb_violations")
-            mmtc_violation = item.get("center_mmtc_violations")
-            total_sla_violation = item.get("center_total_sla_violations")
-            urllc_delay_ms = item.get("center_urllc_delay_ms")
-            quality_score = item.get("quality_score")
-            base_tp = item.get("center_reward_base_tp")
-            system_throughput_mbps = item.get("system_throughput_mbps")
-            trial_dir = item.get("trial_dir")
-            observation_filter = _resolve_trial_observation_filter(trial_dir)
-            algo = build_ippo_eval_algo(observation_filter=observation_filter)
-
-            print(
-                f"Trying checkpoint: {checkpoint_path} "
-                f"(train_seed={train_seed}, iter={iteration}, obs_filter={observation_filter}, "
-                f"total_viol={total_sla_violation}, embb_viol={embb_violation}, "
-                f"urllc_viol={urllc_violation}, mmtc_viol={mmtc_violation}, "
-                f"urllc_delay_ms={urllc_delay_ms}, system_tp={system_throughput_mbps}, base_tp={base_tp}, "
-                f"quality={quality_score}, episode_return_mean={score})"
+        for train_seed, experiment_dir in zip(TRAIN_SEEDS, experiment_dirs):
+            ranked_checkpoints = rank_checkpoints_by_metric(
+                experiment_dir,
+                min_training_iteration=MIN_EVAL_CHECKPOINT_ITER,
+                fallback_to_any=False,
             )
-            try:
-                algo.restore(checkpoint_path)
-                evaluator = {
-                    "algo": algo,
-                    "train_seed": train_seed,
-                    "checkpoint_path": checkpoint_path,
-                    "training_iteration": iteration,
-                    "observation_filter": observation_filter,
-                    "center_urllc_violations": urllc_violation,
-                    "center_embb_violations": embb_violation,
-                    "center_mmtc_violations": mmtc_violation,
-                    "center_total_sla_violations": total_sla_violation,
-                    "center_urllc_delay_ms": urllc_delay_ms,
-                    "center_reward_base_tp": base_tp,
-                    "system_throughput_mbps": system_throughput_mbps,
-                    "episode_return_mean": score,
-                    "quality_score": quality_score,
-                }
-                evaluators.append(evaluator)
-                print(
-                    f"Loaded IPPO checkpoint: {checkpoint_path} "
-                    f"(train_seed={train_seed}, obs_filter={observation_filter}, "
-                    f"total_viol={total_sla_violation}, system_tp={system_throughput_mbps}, "
-                    f"quality={quality_score})"
-                )
-                restored = True
-                break
-            except Exception as exc:  # noqa: PERF203
-                algo.stop()
+            if not ranked_checkpoints:
                 restore_errors.append(
-                    f"train_seed={train_seed}, checkpoint={checkpoint_path}, "
-                    f"obs_filter={observation_filter} -> {exc}"
+                    f"{method_label} train_seed={train_seed}, experiment_dir={experiment_dir} -> "
+                    f"no ranked checkpoint found with iter>={MIN_EVAL_CHECKPOINT_ITER}"
                 )
+                continue
 
-        if not restored:
-            print(f"Warning: no restorable checkpoint found for train_seed={train_seed}.")
+            restored = False
+            for item in ranked_checkpoints:
+                checkpoint_path = item["checkpoint_path"]
+                score = item.get("episode_return_mean")
+                iteration = item.get("training_iteration")
+                urllc_violation = item.get("center_urllc_violations")
+                embb_violation = item.get("center_embb_violations")
+                mmtc_violation = item.get("center_mmtc_violations")
+                total_sla_violation = item.get("center_total_sla_violations")
+                urllc_delay_ms = item.get("center_urllc_delay_ms")
+                quality_score = item.get("quality_score")
+                base_tp = item.get("center_reward_base_tp")
+                system_throughput_mbps = item.get("system_throughput_mbps")
+                trial_dir = item.get("trial_dir")
+                observation_filter = _resolve_trial_observation_filter(trial_dir)
+                algo = build_learned_eval_algo(observation_filter=observation_filter, env_config=env_config)
 
-    if not evaluators:
-        error_preview = "\n".join(restore_errors[:5])
+                print(
+                    f"Trying {method_label} checkpoint: {checkpoint_path} "
+                    f"(train_seed={train_seed}, iter={iteration}, obs_filter={observation_filter}, "
+                    f"total_viol={total_sla_violation}, embb_viol={embb_violation}, "
+                    f"urllc_viol={urllc_violation}, mmtc_viol={mmtc_violation}, "
+                    f"urllc_delay_ms={urllc_delay_ms}, system_tp={system_throughput_mbps}, base_tp={base_tp}, "
+                    f"quality={quality_score}, episode_return_mean={score})"
+                )
+                try:
+                    algo.restore(checkpoint_path)
+                    evaluator = {
+                        "algo_key": algo_key,
+                        "label": method_label,
+                        "algo": algo,
+                        "env_config": dict(env_config),
+                        "train_seed": train_seed,
+                        "checkpoint_path": checkpoint_path,
+                        "training_iteration": iteration,
+                        "observation_filter": observation_filter,
+                        "center_urllc_violations": urllc_violation,
+                        "center_embb_violations": embb_violation,
+                        "center_mmtc_violations": mmtc_violation,
+                        "center_total_sla_violations": total_sla_violation,
+                        "center_urllc_delay_ms": urllc_delay_ms,
+                        "center_reward_base_tp": base_tp,
+                        "system_throughput_mbps": system_throughput_mbps,
+                        "episode_return_mean": score,
+                        "quality_score": quality_score,
+                    }
+                    evaluators_by_algo[algo_key].append(evaluator)
+                    print(
+                        f"Loaded {method_label} checkpoint: {checkpoint_path} "
+                        f"(train_seed={train_seed}, obs_filter={observation_filter}, "
+                        f"total_viol={total_sla_violation}, system_tp={system_throughput_mbps}, "
+                        f"quality={quality_score})"
+                    )
+                    restored = True
+                    break
+                except Exception as exc:  # noqa: PERF203
+                    algo.stop()
+                    restore_errors.append(
+                        f"{method_label} train_seed={train_seed}, checkpoint={checkpoint_path}, "
+                        f"obs_filter={observation_filter} -> {exc}"
+                    )
+
+            if not restored:
+                print(f"Warning: no restorable checkpoint found for {method_label} train_seed={train_seed}.")
+
+    missing_methods = [m["label"] for m in LEARNED_METHODS if not evaluators_by_algo[m["algo_key"]]]
+    if missing_methods:
+        error_preview = "\n".join(restore_errors[:8])
         raise RuntimeError(
-            "No compatible per-seed IPPO checkpoint could be restored.\n"
-            f"Sample restore errors:\n{error_preview}"
+            "Missing learned evaluators for: "
+            + ", ".join(missing_methods)
+            + "\nSample restore errors:\n"
+            + error_preview
         )
 
-    IPPO_EVALUATORS = evaluators
-    return IPPO_EVALUATORS
+    LEARNED_EVALUATORS = evaluators_by_algo
+    return LEARNED_EVALUATORS
 
 
-def run_evaluation(env, algo_name, seed, ippo_evaluator=None):
-    if algo_name == "ippo" and ippo_evaluator is None:
-        raise RuntimeError("IPPO evaluator is not initialized. Call init_ippo_evaluators() first.")
+def run_evaluation(env, algo_name, seed, learned_evaluator=None):
+    if algo_name in LEARNED_METHOD_BY_KEY and learned_evaluator is None:
+        raise RuntimeError(f"{algo_name} evaluator is not initialized. Call init_learned_evaluators() first.")
 
     obs, reset_infos = env.reset(seed=seed)
     done = {"__all__": False}
-    ippo_runner = None
-    ippo_episode = None
-    ippo_shared_data = None
+    learned_runner = None
+    learned_episode = None
+    learned_shared_data = None
 
-    if algo_name == "ippo":
-        ippo_runner, ippo_episode, ippo_shared_data = build_ippo_episode_context(
-            ippo_evaluator["algo"], obs, reset_infos
+    if algo_name in LEARNED_METHOD_BY_KEY:
+        learned_runner, learned_episode, learned_shared_data = build_ippo_episode_context(
+            learned_evaluator["algo"], obs, reset_infos
         )
 
     center_reward = []
@@ -428,13 +489,13 @@ def run_evaluation(env, algo_name, seed, ippo_evaluator=None):
                 ratios = weights / np.sum(weights)
                 actions[agent] = ratios_to_action(ratios, env.action_softmax_temperature)
 
-        elif algo_name == "ippo":
+        elif algo_name in LEARNED_METHOD_BY_KEY:
             start = time.perf_counter()
             policy_actions, actions, extra_model_outputs = compute_actions_batched(
-                ippo_evaluator["algo"],
-                ippo_runner,
-                ippo_episode,
-                ippo_shared_data,
+                learned_evaluator["algo"],
+                learned_runner,
+                learned_episode,
+                learned_shared_data,
             )
             end = time.perf_counter()
             elapsed_ms = (end - start) * 1000.0
@@ -443,12 +504,12 @@ def run_evaluation(env, algo_name, seed, ippo_evaluator=None):
         else:
             extra_model_outputs = None
 
-        if algo_name not in {"static", "priority", "max_weight", "pf", "ippo"}:
+        if algo_name not in {"static", "priority", "max_weight", "pf", *LEARNED_METHOD_BY_KEY.keys()}:
             raise ValueError(f"Unknown algorithm name: {algo_name}")
 
         obs, rewards, terminateds, truncateds, infos = env.step(actions)
-        if algo_name == "ippo":
-            ippo_episode.add_env_step(
+        if algo_name in LEARNED_METHOD_BY_KEY:
+            learned_episode.add_env_step(
                 obs,
                 policy_actions,
                 rewards,
@@ -548,9 +609,9 @@ def run_evaluation(env, algo_name, seed, ippo_evaluator=None):
             float(np.mean(inference_overhead_per_agent_ms)) if inference_overhead_per_agent_ms else np.nan
         ),
     }
-    if algo_name == "ippo":
-        result["train_seed"] = int(ippo_evaluator["train_seed"])
-        result["checkpoint_path"] = str(ippo_evaluator["checkpoint_path"])
+    if algo_name in LEARNED_METHOD_BY_KEY:
+        result["train_seed"] = int(learned_evaluator["train_seed"])
+        result["checkpoint_path"] = str(learned_evaluator["checkpoint_path"])
     return result
 
 
@@ -664,25 +725,28 @@ def plot_with_band(ax, x_axis, mean, std, label, color):
 
 def run_baselines():
     validate_seed_split()
-    print(f"Initializing IPPO checkpoints by training seed (min_iter={MIN_EVAL_CHECKPOINT_ITER})...")
-    ippo_evaluators = init_ippo_evaluators()
-    print("Loaded IPPO evaluators:")
-    for evaluator in ippo_evaluators:
-        print(
-            f"  train_seed={evaluator['train_seed']}, "
-            f"iter={evaluator['training_iteration']}, "
-            f"obs_filter={evaluator['observation_filter']}, "
-            f"quality={evaluator['quality_score']}, "
-            f"checkpoint={evaluator['checkpoint_path']}"
-        )
+    print(f"Initializing learned checkpoints by training seed (min_iter={MIN_EVAL_CHECKPOINT_ITER})...")
+    learned_evaluators_by_algo = init_learned_evaluators()
+    for method in LEARNED_METHODS:
+        algo_key = method["algo_key"]
+        method_label = method["label"]
+        print(f"Loaded {method_label} evaluators:")
+        for evaluator in learned_evaluators_by_algo[algo_key]:
+            print(
+                f"  train_seed={evaluator['train_seed']}, "
+                f"iter={evaluator['training_iteration']}, "
+                f"obs_filter={evaluator['observation_filter']}, "
+                f"quality={evaluator['quality_score']}, "
+                f"checkpoint={evaluator['checkpoint_path']}"
+            )
 
     results_by_algo = {key: [] for key, _ in ALGORITHMS}
 
     for seed in EVAL_SEEDS:
         print(f"\n=== Evaluation seed={seed} ===")
         for algo_key, algo_label in ALGORITHMS:
-            if algo_key != "ippo":
-                env = MultiCell_5G_SLA_Env(config=ENV_CONFIG)
+            if algo_key not in LEARNED_METHOD_BY_KEY:
+                env = MultiCell_5G_SLA_Env(config=HEURISTIC_ENV_CONFIG)
                 run = run_evaluation(env, algo_key, seed)
                 results_by_algo[algo_key].append(run)
 
@@ -695,9 +759,9 @@ def run_baselines():
                 )
                 continue
 
-            for evaluator in ippo_evaluators:
-                env = MultiCell_5G_SLA_Env(config=ENV_CONFIG)
-                run = run_evaluation(env, algo_key, seed, ippo_evaluator=evaluator)
+            for evaluator in learned_evaluators_by_algo[algo_key]:
+                env = MultiCell_5G_SLA_Env(config=evaluator["env_config"])
+                run = run_evaluation(env, algo_key, seed, learned_evaluator=evaluator)
                 results_by_algo[algo_key].append(run)
 
                 print(
@@ -719,11 +783,14 @@ def run_baselines():
     aggregated = aggregate_results(results_by_algo)
 
     print("\n=== Summary (mean ± std over recorded runs) ===")
-    print(
-        f"Heuristic baselines use {len(EVAL_SEEDS)} evaluation seeds each; "
-        f"IPPO uses {len(ippo_evaluators)} training-seed checkpoints x {len(EVAL_SEEDS)} "
-        f"evaluation seeds = {len(results_by_algo['ippo'])} runs."
+    learned_run_text = "; ".join(
+        [
+            f"{m['label']} uses {len(learned_evaluators_by_algo[m['algo_key']])} training-seed checkpoints "
+            f"x {len(EVAL_SEEDS)} evaluation seeds = {len(results_by_algo[m['algo_key']])} runs"
+            for m in LEARNED_METHODS
+        ]
     )
+    print(f"Heuristic baselines use {len(EVAL_SEEDS)} evaluation seeds each; {learned_run_text}.")
     for algo_key, algo_label in main_comparison_algorithms():
         stats = aggregated[algo_key]
         fairness_text = f"JFI={stats['fairness_mean']:.4f} ± {stats['fairness_std']:.4f}"
@@ -760,7 +827,7 @@ def run_baselines():
         print(f"{' ':>22}{sla_sys_text}")
         print(f"{' ':>22}{reward_base_text}, {penalty_text}")
         print(f"{' ':>22}{penalty_share_text}")
-        if algo_key == "ippo":
+        if algo_key in LEARNED_METHOD_BY_KEY:
             print(
                 " " * 22
                 + "Inference total="
@@ -856,16 +923,18 @@ def run_baselines():
     ax5.grid(True, axis="y")
     ax5.tick_params(axis="x", rotation=20)
 
-    ippo_stats = aggregated["ippo"]
+    learned_inference_lines = []
+    for method in LEARNED_METHODS:
+        stats = aggregated[method["algo_key"]]
+        learned_inference_lines.append(
+            f"{method['algo_key'].upper()}: total={stats['inference_total_ms_mean']:.4f} ms, "
+            f"per-agent={stats['inference_per_agent_ms_mean']:.4f} ms, "
+            f"p95={stats['inference_p95_total_ms_mean']:.4f} ms"
+        )
     ax5.text(
         0.02,
         0.92,
-        (
-            "IPPO inference overhead:\n"
-            f"total={ippo_stats['inference_total_ms_mean']:.4f} ms\n"
-            f"per-agent={ippo_stats['inference_per_agent_ms_mean']:.4f} ms\n"
-            f"p95(total)={ippo_stats['inference_p95_total_ms_mean']:.4f} ms"
-        ),
+        "Inference overhead:\n" + "\n".join(learned_inference_lines),
         transform=ax5.transAxes,
         verticalalignment="top",
         bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "gray"},
@@ -905,7 +974,7 @@ def run_baselines():
     plt.savefig(output_path)
     print(f"Saved comparison plots to {output_path}")
 
-    stop_ippo_evaluators()
+    stop_learned_evaluators()
     if ray.is_initialized():
         ray.shutdown()
 
