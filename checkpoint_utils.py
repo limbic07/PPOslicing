@@ -17,19 +17,30 @@ def _extract_metrics(record):
     center_urllc_viol = custom_metrics.get("center_urllc_violations")
     center_urllc_delay_ms = custom_metrics.get("center_urllc_delay_ms")
     center_embb_viol = custom_metrics.get("center_embb_violations")
+    center_mmtc_viol = custom_metrics.get("center_mmtc_violations")
     center_embb_sla_ok = custom_metrics.get("center_embb_sla_ok")
     center_urllc_sla_ok = custom_metrics.get("center_urllc_sla_ok")
+    center_mmtc_sla_ok = custom_metrics.get("center_mmtc_sla_ok")
     center_reward_base_tp = custom_metrics.get("center_reward_base_tp")
+    system_throughput_mbps = custom_metrics.get("system_throughput_mbps")
 
     metrics = {
         "episode_return_mean": float(episode_return_mean) if episode_return_mean is not None else None,
         "center_urllc_violations": float(center_urllc_viol) if center_urllc_viol is not None else None,
         "center_urllc_delay_ms": float(center_urllc_delay_ms) if center_urllc_delay_ms is not None else None,
         "center_embb_violations": float(center_embb_viol) if center_embb_viol is not None else None,
+        "center_mmtc_violations": float(center_mmtc_viol) if center_mmtc_viol is not None else None,
         "center_embb_sla_ok": float(center_embb_sla_ok) if center_embb_sla_ok is not None else None,
         "center_urllc_sla_ok": float(center_urllc_sla_ok) if center_urllc_sla_ok is not None else None,
+        "center_mmtc_sla_ok": float(center_mmtc_sla_ok) if center_mmtc_sla_ok is not None else None,
         "center_reward_base_tp": float(center_reward_base_tp) if center_reward_base_tp is not None else None,
+        "system_throughput_mbps": float(system_throughput_mbps) if system_throughput_mbps is not None else None,
     }
+    metrics["center_total_sla_violations"] = _sum_available_violations(
+        metrics.get("center_embb_violations"),
+        metrics.get("center_urllc_violations"),
+        metrics.get("center_mmtc_violations"),
+    )
     metrics["quality_score"] = _compute_quality_score(metrics)
     return metrics
 
@@ -123,6 +134,32 @@ def _normalize_base_tp(base_tp):
     return max(0.0, min(float(base_tp), 1.0))
 
 
+def _sum_available_violations(*violations):
+    available = [max(float(v), 0.0) for v in violations if v is not None]
+    if not available:
+        return None
+    return float(sum(available))
+
+
+def _select_throughput_metric(metrics):
+    # Prefer explicit system throughput; fallback to center throughput proxy for old logs.
+    system_tp = metrics.get("system_throughput_mbps")
+    if system_tp is not None:
+        return float(system_tp)
+
+    base_tp = metrics.get("center_reward_base_tp")
+    if base_tp is not None:
+        return float(base_tp)
+    return None
+
+
+def _normalize_throughput_metric(metrics):
+    system_tp = metrics.get("system_throughput_mbps")
+    if system_tp is not None:
+        return math.tanh(max(float(system_tp), 0.0) / 2000.0)
+    return _normalize_base_tp(metrics.get("center_reward_base_tp"))
+
+
 def _normalize_violation(violation, decay):
     if violation is None:
         return None
@@ -145,21 +182,17 @@ def _normalize_episode_return(episode_return_mean, scale=1000.0):
 
 
 def _compute_quality_score(metrics):
-    # Conservative checkpoint ranking:
-    # URLLC feasibility dominates, eMBB and delay come next,
-    # throughput proxy and return only act as secondary tie-break quality terms.
-    urllc_quality = _normalize_violation(metrics.get("center_urllc_violations"), decay=4.0)
-    embb_quality = _normalize_violation(metrics.get("center_embb_violations"), decay=2.0)
-    urllc_delay_quality = _normalize_urllc_delay(metrics.get("center_urllc_delay_ms"))
-    base_tp_norm = _normalize_base_tp(metrics.get("center_reward_base_tp"))
+    # Violation-first quality summary:
+    # total SLA violation is dominant, throughput is secondary.
+    total_violation = metrics.get("center_total_sla_violations")
+    violation_quality = _normalize_violation(total_violation, decay=1.0)
+    throughput_quality = _normalize_throughput_metric(metrics)
     return_quality = _normalize_episode_return(metrics.get("episode_return_mean"))
 
     components = [
-        (0.45, urllc_quality),
-        (0.25, embb_quality),
-        (0.10, urllc_delay_quality),
-        (0.10, base_tp_norm),
-        (0.10, return_quality),
+        (0.80, violation_quality),
+        (0.15, throughput_quality),
+        (0.05, return_quality),
     ]
     available = [(weight, value) for weight, value in components if value is not None]
     if not available:
@@ -171,25 +204,36 @@ def _compute_quality_score(metrics):
 
 
 def _ranking_key(item):
-    # Conservative selection: prioritize SLA feasibility first, then throughput proxy.
+    # Violation-first selection: lowest total SLA violation wins.
+    # Throughput is the secondary criterion (system throughput preferred).
+    total_viol = item.get("center_total_sla_violations")
+    system_tp = item.get("system_throughput_mbps")
+    throughput_metric = _select_throughput_metric(item)
     quality = item.get("quality_score")
-    viol = item.get("center_urllc_violations")
+    urllc_viol = item.get("center_urllc_violations")
     embb_viol = item.get("center_embb_violations")
+    mmtc_viol = item.get("center_mmtc_violations")
     delay = item.get("center_urllc_delay_ms")
-    base_tp = item.get("center_reward_base_tp")
     ret = item.get("episode_return_mean")
     iter_ = item.get("training_iteration", -1)
 
     return (
+        0 if total_viol is not None else 1,
+        total_viol if total_viol is not None else float("inf"),
+        0 if system_tp is not None else 1,
+        -(system_tp if system_tp is not None else float("-inf")),
+        0 if throughput_metric is not None else 1,
+        -(throughput_metric if throughput_metric is not None else float("-inf")),
         0 if quality is not None else 1,
         -(quality if quality is not None else float("-inf")),
-        0 if viol is not None else 1,
-        viol if viol is not None else float("inf"),
+        0 if urllc_viol is not None else 1,
+        urllc_viol if urllc_viol is not None else float("inf"),
         0 if delay is not None else 1,
         delay if delay is not None else float("inf"),
         0 if embb_viol is not None else 1,
         embb_viol if embb_viol is not None else float("inf"),
-        -(base_tp if base_tp is not None else float("-inf")),
+        0 if mmtc_viol is not None else 1,
+        mmtc_viol if mmtc_viol is not None else float("inf"),
         -(ret if ret is not None else float("-inf")),
         -iter_,
         -item.get("ctime", 0.0),
@@ -232,9 +276,13 @@ def _collect_ranked_checkpoints(experiment_dirs, min_training_iteration):
                         "center_urllc_violations": metrics.get("center_urllc_violations"),
                         "center_urllc_delay_ms": metrics.get("center_urllc_delay_ms"),
                         "center_embb_violations": metrics.get("center_embb_violations"),
+                        "center_mmtc_violations": metrics.get("center_mmtc_violations"),
+                        "center_total_sla_violations": metrics.get("center_total_sla_violations"),
                         "center_embb_sla_ok": metrics.get("center_embb_sla_ok"),
                         "center_urllc_sla_ok": metrics.get("center_urllc_sla_ok"),
+                        "center_mmtc_sla_ok": metrics.get("center_mmtc_sla_ok"),
                         "center_reward_base_tp": metrics.get("center_reward_base_tp"),
+                        "system_throughput_mbps": metrics.get("system_throughput_mbps"),
                         "quality_score": metrics.get("quality_score"),
                         "experiment_dir": str(exp_dir),
                         "trial_dir": str(trial_dir),

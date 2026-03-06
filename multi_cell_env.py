@@ -112,10 +112,14 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
             cfg_value("interference_neighbor_normalization", "fixed_max")
         ).lower()
         self.tail_reward_throughput_weight = float(cfg_value("tail_reward_throughput_weight", 1.0 / 300.0))
-        self.binary_reward_throughput_scale = float(cfg_value("binary_reward_throughput_scale", 100.0))
-        self.binary_penalty_embb = float(cfg_value("binary_penalty_embb", 6.0))
-        self.binary_penalty_urllc = float(cfg_value("binary_penalty_urllc", 12.0))
-        self.binary_penalty_mmtc = float(cfg_value("binary_penalty_mmtc", 6.0))
+        self.binary_reward_throughput_scale = float(cfg_value("binary_reward_throughput_scale", 80.0))
+        self.binary_penalty_embb = float(cfg_value("binary_penalty_embb", 4.0))
+        self.binary_penalty_urllc = float(cfg_value("binary_penalty_urllc", 6.0))
+        self.binary_penalty_mmtc = float(cfg_value("binary_penalty_mmtc", 4.0))
+        self.binary_urllc_yellow_start_ratio = float(cfg_value("binary_urllc_yellow_start_ratio", 0.5))
+        self.binary_urllc_yellow_penalty = float(
+            cfg_value("binary_urllc_yellow_penalty", self.binary_penalty_urllc)
+        )
         self.simple_reward_embb_target_weight = float(cfg_value("simple_reward_embb_target_weight", 1.2))
         self.simple_reward_throughput_weight = float(cfg_value("simple_reward_throughput_weight", 0.2))
         self.simple_reward_bonus_embb = float(cfg_value("simple_reward_bonus_embb", 0.60))
@@ -192,10 +196,12 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 "ici_gain": 0.50,
                 "se_modifier_floor": 0.45,
                 "interference_neighbor_normalization": "actual_neighbors",
-                "binary_reward_throughput_scale": 100.0,
-                "binary_penalty_embb": 6.0,
-                "binary_penalty_urllc": 12.0,
-                "binary_penalty_mmtc": 6.0,
+                "binary_reward_throughput_scale": 80.0,
+                "binary_penalty_embb": 4.0,
+                "binary_penalty_urllc": 6.0,
+                "binary_penalty_mmtc": 4.0,
+                "binary_urllc_yellow_start_ratio": 0.5,
+                "binary_urllc_yellow_penalty": 6.0,
                 "center_reward_scale": 1.0,
                 "reward_clip_abs": 0.0,
                 "embb_violation_cap": 2.0,
@@ -375,11 +381,17 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
             "penalty_mmtc": float(pen_mmtc),
         }
 
-    def _compute_binary_sla_reward(self, throughput_mbps, violation_flags):
+    def _compute_binary_sla_reward(self, throughput_mbps, violation_flags, est_delay):
         violation_flags = np.asarray(violation_flags, dtype=np.float32)
         throughput_bonus = float(throughput_mbps / max(self.binary_reward_throughput_scale, 1e-6))
         pen_embb = float(self.binary_penalty_embb * violation_flags[0])
-        pen_urllc = float(self.binary_penalty_urllc * violation_flags[1])
+        max_delay = max(self.sla_props["urllc_max_delay"], 1e-6)
+        urllc_delay_ratio = max(float(est_delay), 0.0) / max_delay
+        yellow_start = float(np.clip(self.binary_urllc_yellow_start_ratio, 0.0, 0.999999))
+        yellow_progress = float(np.clip((urllc_delay_ratio - yellow_start) / max(1.0 - yellow_start, 1e-6), 0.0, 1.0))
+        pen_urllc_yellow = float(self.binary_urllc_yellow_penalty * yellow_progress)
+        pen_urllc_red = float(self.binary_penalty_urllc * violation_flags[1])
+        pen_urllc = float(pen_urllc_red + pen_urllc_yellow)
         pen_mmtc = float(self.binary_penalty_mmtc * violation_flags[2])
         penalty_total = float(pen_embb + pen_urllc + pen_mmtc)
         reward_local = float(throughput_bonus - penalty_total)
@@ -395,6 +407,8 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
             "penalty_embb": pen_embb,
             "penalty_urllc": pen_urllc,
             "penalty_mmtc": pen_mmtc,
+            "penalty_urllc_yellow": pen_urllc_yellow,
+            "penalty_urllc_red": pen_urllc_red,
         }
 
     def _compute_simple_local_reward(self, throughput_mbps, embb_eval_tp_mbps, violations):
@@ -539,7 +553,7 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
             if self.reward_mode == "tail_risk_coop":
                 reward_terms = self._compute_tail_risk_reward(throughput_mbps_total, violations, est_delay)
             elif self.reward_mode == "binary_sla_reward":
-                reward_terms = self._compute_binary_sla_reward(throughput_mbps_total, violation_flags)
+                reward_terms = self._compute_binary_sla_reward(throughput_mbps_total, violation_flags, est_delay)
             elif self.reward_mode == "simple_local_sla":
                 reward_terms = self._compute_simple_local_reward(
                     throughput_mbps_total,
@@ -590,6 +604,8 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 "penalty_embb": np.float32(reward_terms["penalty_embb"]),
                 "penalty_urllc": np.float32(reward_terms["penalty_urllc"]),
                 "penalty_mmtc": np.float32(reward_terms["penalty_mmtc"]),
+                "penalty_urllc_yellow": np.float32(reward_terms.get("penalty_urllc_yellow", 0.0)),
+                "penalty_urllc_red": np.float32(reward_terms.get("penalty_urllc_red", 0.0)),
                 "penalty_raw": np.array(
                     [
                         reward_terms["penalty_raw_embb"],

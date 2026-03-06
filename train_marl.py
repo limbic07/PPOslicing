@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import os
 import warnings
 
@@ -71,10 +72,12 @@ ENV_CONFIG = {
     "urllc_burst_end_prob": 0.35,
     "urllc_burst_mean_mbps": 100.0,
     "urllc_burst_std_mbps": 15.0,
-    "binary_reward_throughput_scale": 100.0,
-    "binary_penalty_embb": 6.0,
-    "binary_penalty_urllc": 12.0,
-    "binary_penalty_mmtc": 6.0,
+    "binary_reward_throughput_scale": 80.0,
+    "binary_penalty_embb": 4.0,
+    "binary_penalty_urllc": 6.0,
+    "binary_penalty_mmtc": 4.0,
+    "binary_urllc_yellow_start_ratio": 0.5,
+    "binary_urllc_yellow_penalty": 6.0,
     "tail_reward_throughput_weight": 1.0 / 300.0,
     "center_reward_scale": 1.0,
     "reward_clip_abs": 0.0,
@@ -128,6 +131,7 @@ class SLACallbacks(DefaultCallbacks):
 
         # New stack (env_runner) path.
         info = None
+        infos = None
         if hasattr(episode, "get_infos"):
             infos = episode.get_infos(-1)
             if isinstance(infos, dict):
@@ -155,6 +159,7 @@ class SLACallbacks(DefaultCallbacks):
             log_custom_metric("center_urllc_violations", info["violations"][1])
             log_custom_metric("center_embb_violations", info["violations"][0])
             log_custom_metric("center_mmtc_violations", info["violations"][2])
+            log_custom_metric("center_total_sla_violations", float(np.sum(np.asarray(info["violations"]))))
             log_custom_metric("center_embb_sla_ok", float(info["violations"][0] <= 0.0))
             log_custom_metric("center_urllc_sla_ok", float(info["violations"][1] <= 0.0))
             log_custom_metric("center_mmtc_sla_ok", float(info["violations"][2] <= 0.0))
@@ -191,6 +196,16 @@ class SLACallbacks(DefaultCallbacks):
             log_custom_metric("center_penalty_share_urllc", float(info["penalty_urllc"]) / penalty_total)
             log_custom_metric("center_penalty_share_mmtc", float(info["penalty_mmtc"]) / penalty_total)
 
+        if isinstance(infos, dict):
+            system_throughput_mbps = 0.0
+            has_system_tp = False
+            for agent_info in infos.values():
+                if isinstance(agent_info, dict) and "throughput" in agent_info:
+                    system_throughput_mbps += float(agent_info["throughput"])
+                    has_system_tp = True
+            if has_system_tp:
+                log_custom_metric("system_throughput_mbps", system_throughput_mbps)
+
 
 def policy_mapping_fn(agent_id, *args, **kwargs):
     return "center_policy" if agent_id == "BS_0" else "edge_policy"
@@ -224,7 +239,8 @@ def resolve_hw_profile(hw_profile: str, mode: str):
     if hw_profile == "maxperf":
         num_env_runners = max(2, min(12, cpu_total - 2))
         num_envs_per_env_runner = 1
-        rollout_fragment_length = 300
+        # Keep fragment geometry compatible with maxperf train-batch targets.
+        rollout_fragment_length = 400
         train_batch_floor = 4800
         mini_batch_size_per_learner = 1024
         num_sgd_iter = 8
@@ -250,13 +266,32 @@ def resolve_hw_profile(hw_profile: str, mode: str):
     }
 
 
+def _resolve_train_batch_per_learner(hw_cfg):
+    num_env_runners = int(hw_cfg["num_env_runners"])
+    num_envs_per_env_runner = int(hw_cfg["num_envs_per_env_runner"])
+    rollout_fragment_length = hw_cfg["rollout_fragment_length"]
+    train_batch_floor = int(hw_cfg["train_batch_floor"])
+
+    if not isinstance(rollout_fragment_length, int) or rollout_fragment_length <= 0:
+        return train_batch_floor
+
+    fragment_bundle = num_env_runners * num_envs_per_env_runner * rollout_fragment_length
+    if fragment_bundle <= 0:
+        return train_batch_floor
+
+    target = max(train_batch_floor, fragment_bundle)
+    nearest_multiple = max(1, round(target / fragment_bundle)) * fragment_bundle
+    nearest_gap_ratio = abs(nearest_multiple - target) / max(float(target), 1.0)
+
+    # Align to rollout geometry. Prefer nearest if within RLlib's 10% tolerance.
+    if nearest_gap_ratio <= 0.10:
+        return int(nearest_multiple)
+
+    return int(math.ceil(target / fragment_bundle) * fragment_bundle)
+
+
 def build_config(seed, num_learners, num_gpus_per_learner, hw_cfg, env_config):
-    auto_train_batch = (
-        hw_cfg["num_env_runners"]
-        * hw_cfg["num_envs_per_env_runner"]
-        * hw_cfg["rollout_fragment_length"]
-    )
-    train_batch_per_learner = max(hw_cfg["train_batch_floor"], auto_train_batch)
+    train_batch_per_learner = _resolve_train_batch_per_learner(hw_cfg)
 
     return (
         PPOConfig()

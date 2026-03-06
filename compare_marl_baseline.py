@@ -81,10 +81,12 @@ ENV_CONFIG = {
     "urllc_burst_end_prob": 0.35,
     "urllc_burst_mean_mbps": 100.0,
     "urllc_burst_std_mbps": 15.0,
-    "binary_reward_throughput_scale": 100.0,
-    "binary_penalty_embb": 6.0,
-    "binary_penalty_urllc": 12.0,
-    "binary_penalty_mmtc": 6.0,
+    "binary_reward_throughput_scale": 80.0,
+    "binary_penalty_embb": 4.0,
+    "binary_penalty_urllc": 6.0,
+    "binary_penalty_mmtc": 4.0,
+    "binary_urllc_yellow_start_ratio": 0.5,
+    "binary_urllc_yellow_penalty": 6.0,
     "tail_reward_throughput_weight": 1.0 / 300.0,
     "center_reward_scale": 1.0,
     "reward_clip_abs": 0.0,
@@ -277,9 +279,12 @@ def init_ippo_evaluators():
             iteration = item.get("training_iteration")
             urllc_violation = item.get("center_urllc_violations")
             embb_violation = item.get("center_embb_violations")
+            mmtc_violation = item.get("center_mmtc_violations")
+            total_sla_violation = item.get("center_total_sla_violations")
             urllc_delay_ms = item.get("center_urllc_delay_ms")
             quality_score = item.get("quality_score")
             base_tp = item.get("center_reward_base_tp")
+            system_throughput_mbps = item.get("system_throughput_mbps")
             trial_dir = item.get("trial_dir")
             observation_filter = _resolve_trial_observation_filter(trial_dir)
             algo = build_ippo_eval_algo(observation_filter=observation_filter)
@@ -287,8 +292,9 @@ def init_ippo_evaluators():
             print(
                 f"Trying checkpoint: {checkpoint_path} "
                 f"(train_seed={train_seed}, iter={iteration}, obs_filter={observation_filter}, "
-                f"urllc_viol={urllc_violation}, embb_viol={embb_violation}, "
-                f"urllc_delay_ms={urllc_delay_ms}, base_tp={base_tp}, "
+                f"total_viol={total_sla_violation}, embb_viol={embb_violation}, "
+                f"urllc_viol={urllc_violation}, mmtc_viol={mmtc_violation}, "
+                f"urllc_delay_ms={urllc_delay_ms}, system_tp={system_throughput_mbps}, base_tp={base_tp}, "
                 f"quality={quality_score}, episode_return_mean={score})"
             )
             try:
@@ -301,8 +307,11 @@ def init_ippo_evaluators():
                     "observation_filter": observation_filter,
                     "center_urllc_violations": urllc_violation,
                     "center_embb_violations": embb_violation,
+                    "center_mmtc_violations": mmtc_violation,
+                    "center_total_sla_violations": total_sla_violation,
                     "center_urllc_delay_ms": urllc_delay_ms,
                     "center_reward_base_tp": base_tp,
+                    "system_throughput_mbps": system_throughput_mbps,
                     "episode_return_mean": score,
                     "quality_score": quality_score,
                 }
@@ -310,6 +319,7 @@ def init_ippo_evaluators():
                 print(
                     f"Loaded IPPO checkpoint: {checkpoint_path} "
                     f"(train_seed={train_seed}, obs_filter={observation_filter}, "
+                    f"total_viol={total_sla_violation}, system_tp={system_throughput_mbps}, "
                     f"quality={quality_score})"
                 )
                 restored = True

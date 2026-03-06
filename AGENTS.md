@@ -152,8 +152,10 @@ flake8 . --max-line-length=120
   - `embb_violation_cap=2.0, urllc_violation_cap=5.0, mmtc_violation_cap=2.0`
 - `balanced` 环境下，训练奖励改为 binary SLA reward：
   - `cooperative_alpha = 1.0`
-  - `binary_reward_throughput_scale = 100.0`
-  - `binary_penalty_embb/urllc/mmtc = 6 / 12 / 6`
+  - `binary_reward_throughput_scale = 80.0`
+  - `binary_penalty_embb/urllc/mmtc = 4 / 6 / 4`
+  - `binary_urllc_yellow_start_ratio = 0.5`（1ms 黄灯起点，2ms 红线）
+  - `binary_urllc_yellow_penalty = 6.0`（黄灯区随延迟线性增加）
   - `center_reward_scale = 1.0`
   - `reward_clip_abs = 0.0`
 
@@ -239,11 +241,10 @@ flake8 . --max-line-length=120
 ### 5.4 Checkpoint 选择
 - 使用 `checkpoint_utils.rank_checkpoints_by_metric()`：
   - `compare_marl_baseline.py` 当前使用 `min_training_iteration=50`，禁止早期 checkpoint 混入正式对比
-  - 优先综合质量分 `quality_score`
-  - 当前采用保守选模（conservative ranking），直接基于中心小区原始物理指标打分，不再依赖 `sla_ok` proxy
-  - `quality_score = 0.45 * exp(-4 * urllc_violation) + 0.25 * exp(-2 * embb_violation) + 0.10 * exp(-max(urllc_delay_ms - 2.0, 0)) + 0.10 * clip(base_tp, 0, 1) + 0.10 * tanh_norm(return)`
-  - 设计原则：先保 `URLLC` 可行性，再看 `eMBB`，吞吐与回报只作次级参考，避免高吞吐掩盖严重 SLA 违规
-  - 同分时再按：低 URLLC violation、低 URLLC delay、低 eMBB violation、高 throughput proxy、高 return 排序
+  - 当前主排序规则：先最小化 `center_total_sla_violations = embb_viol + urllc_viol + mmtc_viol`
+  - 次排序规则：最大化 `system_throughput_mbps`（若历史日志无该指标，则回退到 `center_reward_base_tp` 作为吞吐 proxy）
+  - `quality_score` 仅作为次级辅助摘要分，不再作为首要排序依据
+  - 设计原则：先保“三 SLA 总体违约最少”，再比较吞吐，避免高吞吐掩盖 SLA 失效
 
 ---
 
