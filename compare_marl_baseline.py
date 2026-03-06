@@ -1,16 +1,24 @@
+import json
 import os
+import pickle
 import time
 import warnings
+from collections import defaultdict
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import ray
-import torch
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.core import Columns
 from ray.tune.registry import register_env
 
 from checkpoint_utils import rank_checkpoints_by_metric
+from ippo_rl_module import (
+    DEFAULT_INITIAL_ACTION_LOG_STD,
+    DEFAULT_INITIAL_SLICE_RATIOS,
+    build_initialized_rl_module_spec,
+)
 from multi_cell_env import MultiCell_5G_SLA_Env
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -21,15 +29,19 @@ EPS = 1e-5
 PF_MA_ALPHA = 0.9
 ROLLOUT_STEPS = 200
 TRAIN_SEEDS = [2026, 2027, 2028]
-EVAL_SEEDS = [2026, 2027, 2028, 2029]
-MAPPO_EXPERIMENT_DIRS = [f"./ray_results/MAPPO_5G_Slicing_seed{seed}" for seed in TRAIN_SEEDS]
+EVAL_SEEDS = [3026, 3027, 3028, 3029]
+ENV_PROFILE = "balanced"
+OBSERVATION_MODE = "pure_local"
+EXPERIMENT_ENV_TAG = "balanced_ippo_v1"
+MIN_EVAL_CHECKPOINT_ITER = 50
+IPPO_EXPERIMENT_DIRS = [f"./ray_results/MAPPO_5G_Slicing_{EXPERIMENT_ENV_TAG}_seed{seed}" for seed in TRAIN_SEEDS]
 
 ALGORITHMS = [
-    ("static", "Static Equal Share"),
+    ("static", "Static SLA Split"),
     ("priority", "Priority Heuristic"),
-    ("max_weight", "Max-Weight"),
+    ("max_weight", "Max-Weight (Throughput-Oriented Heuristic)"),
     ("pf", "Proportional Fair"),
-    ("mappo", "MAPPO (Proposed)"),
+    ("ippo", "IPPO (pure_local)"),
 ]
 
 PLOT_COLORS = {
@@ -37,24 +49,62 @@ PLOT_COLORS = {
     "priority": "#ff7f0e",
     "max_weight": "#2ca02c",
     "pf": "#d62728",
-    "mappo": "#9467bd",
+    "ippo": "#9467bd",
 }
 
 ENV_CONFIG = {
+    "env_profile": ENV_PROFILE,
+    "observation_mode": OBSERVATION_MODE,
+    "action_softmax_temperature": 3.0,
     "penalty_weight": 0.7,
-    "urllc_warning_ratio": 0.65,
-    "urllc_softplus_slope": 12.0,
-    "urllc_warning_gain": 1.0,
-    "urllc_overflow_gain": 6.0,
-    "urllc_exp_coeff": 2.5,
-    "urllc_penalty_cap_factor": 20.0,
-    "embb_penalty_quad_gain": 1.2,
-    "embb_penalty_cap_factor": 10.0,
-    "ici_gain": 0.65,
-    "se_modifier_floor": 0.3,
+    "w_embb": 1.0,
+    "w_urllc": 0.30,
+    "w_mmtc": 0.7,
+    "urllc_warning_ratio": 0.90,
+    "urllc_tail_ratio": 0.92,
+    "urllc_softplus_slope": 10.0,
+    "urllc_warning_gain": 0.20,
+    "urllc_tail_quad_gain": 2.0,
+    "urllc_hard_violation_gain": 1.75,
+    "urllc_overflow_gain": 2.2,
+    "urllc_exp_coeff": 1.6,
+    "urllc_penalty_cap_factor": 10.0,
+    "embb_penalty_quad_gain": 2.5,
+    "embb_penalty_cubic_gain": 1.2,
+    "embb_penalty_cap_factor": 16.0,
+    "mmtc_penalty_cap_factor": 5.0,
+    "embb_violation_cap": 2.0,
+    "urllc_violation_cap": 5.0,
+    "mmtc_violation_cap": 2.0,
+    "embb_gbr": 220.0,
+    "urllc_burst_start_prob": 0.06,
+    "urllc_burst_end_prob": 0.35,
+    "urllc_burst_mean_mbps": 100.0,
+    "urllc_burst_std_mbps": 15.0,
+    "binary_reward_throughput_scale": 100.0,
+    "binary_penalty_embb": 6.0,
+    "binary_penalty_urllc": 12.0,
+    "binary_penalty_mmtc": 6.0,
+    "tail_reward_throughput_weight": 1.0 / 300.0,
+    "center_reward_scale": 1.0,
+    "reward_clip_abs": 0.0,
 }
 
-MAPPO_ALGO = None
+DEFAULT_OBSERVATION_FILTER = "MeanStdFilter"
+IPPO_EVALUATORS = []
+
+
+def validate_seed_split():
+    overlap = sorted(set(TRAIN_SEEDS).intersection(EVAL_SEEDS))
+    if overlap:
+        raise ValueError(
+            "TRAIN_SEEDS and EVAL_SEEDS must be disjoint for unbiased evaluation. "
+            f"Overlapping seeds: {overlap}"
+        )
+
+
+def main_comparison_algorithms():
+    return list(ALGORITHMS)
 
 
 def env_creator(env_config):
@@ -68,37 +118,44 @@ def policy_mapping_fn(agent_id, *args, **kwargs):
     return "center_policy" if agent_id == "BS_0" else "edge_policy"
 
 
-def compute_actions_batched_new_stack(algo, obs_dict):
-    obs_by_policy = {"center_policy": [], "edge_policy": []}
-    agent_ids_by_policy = {"center_policy": [], "edge_policy": []}
-
-    for agent_id, agent_obs in obs_dict.items():
-        policy_id = policy_mapping_fn(agent_id)
-        obs_by_policy[policy_id].append(agent_obs)
-        agent_ids_by_policy[policy_id].append(agent_id)
-
-    actions = {}
-    for policy_id in ("center_policy", "edge_policy"):
-        if not obs_by_policy[policy_id]:
-            continue
-
-        module = algo.get_module(policy_id)
-        obs_batch = torch.as_tensor(np.stack(obs_by_policy[policy_id], axis=0), dtype=torch.float32)
-
-        with torch.no_grad():
-            module_out = module.forward_inference({Columns.OBS: obs_batch})
-            dist_cls = module.get_inference_action_dist_cls()
-            action_dist = dist_cls.from_logits(module_out[Columns.ACTION_DIST_INPUTS]).to_deterministic()
-            action_batch = action_dist.sample().cpu().numpy().astype(np.float32)
-
-        action_batch = np.clip(action_batch, -1.0, 1.0)
-        for idx, agent_id in enumerate(agent_ids_by_policy[policy_id]):
-            actions[agent_id] = action_batch[idx]
-
-    return actions
+def build_ippo_episode_context(algo, obs_dict, infos):
+    runner = algo.env_runner_group.local_env_runner
+    runner._cached_to_module = None
+    episode = runner._new_episode()
+    shared_data = {"agent_to_module_mapping_fn": runner.config.policy_mapping_fn}
+    episode.add_env_reset(observations=obs_dict, infos=infos)
+    return runner, episode, shared_data
 
 
-def ratios_to_action(ratios: np.ndarray) -> np.ndarray:
+def compute_actions_batched(algo, runner, episode, shared_data):
+    """Run RLlib new-stack connector pipeline to preserve observation processing."""
+    to_module = runner._env_to_module(
+        rl_module=runner.module,
+        episodes=[episode],
+        explore=False,
+        shared_data=shared_data,
+    )
+    to_env = runner.module.forward_inference(to_module)
+    to_env = runner._module_to_env(
+        rl_module=runner.module,
+        data=to_env,
+        episodes=[episode],
+        explore=False,
+        shared_data=shared_data,
+    )
+
+    actions = to_env.pop(Columns.ACTIONS)
+    actions_for_env = to_env.pop(Columns.ACTIONS_FOR_ENV, actions)
+    extra_model_outputs = defaultdict(dict)
+    for col, ma_dict_list in to_env.items():
+        ma_dict = ma_dict_list[0]
+        for agent_id, value in ma_dict.items():
+            extra_model_outputs[agent_id][col] = value
+
+    return actions[0], actions_for_env[0], dict(extra_model_outputs)
+
+
+def ratios_to_action(ratios: np.ndarray, temperature: float) -> np.ndarray:
     ratios = np.asarray(ratios, dtype=np.float32)
     ratios = np.clip(ratios, 1e-8, None)
     ratio_sum = float(np.sum(ratios))
@@ -107,8 +164,9 @@ def ratios_to_action(ratios: np.ndarray) -> np.ndarray:
     else:
         ratios = ratios / ratio_sum
 
-    weights = np.clip(ratios, 0.01, 1.0)
-    action = (weights * 2.0) - 1.0
+    logits = np.log(ratios)
+    logits = logits - np.mean(logits)
+    action = logits / max(float(temperature), 1e-6)
     return np.clip(action, -1.0, 1.0).astype(np.float32)
 
 
@@ -124,74 +182,187 @@ def compute_jain_fairness(values: np.ndarray) -> float:
     return numerator / denominator
 
 
-def init_mappo_algo() -> str:
-    global MAPPO_ALGO
+def _load_trial_params(trial_dir: str) -> dict:
+    trial_path = Path(trial_dir)
+    params_json = trial_path / "params.json"
+    if params_json.exists():
+        with params_json.open("r", encoding="utf-8") as file_obj:
+            data = json.load(file_obj)
+        if isinstance(data, dict):
+            return data
 
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
+    params_pkl = trial_path / "params.pkl"
+    if params_pkl.exists():
+        with params_pkl.open("rb") as file_obj:
+            data = pickle.load(file_obj)
+        if isinstance(data, dict):
+            return data
 
+    return {}
+
+
+def _resolve_trial_observation_filter(trial_dir: str | None) -> str:
+    if not trial_dir:
+        return DEFAULT_OBSERVATION_FILTER
+
+    params = _load_trial_params(trial_dir)
+    observation_filter = params.get("observation_filter")
+    if observation_filter is None:
+        return DEFAULT_OBSERVATION_FILTER
+    return str(observation_filter)
+
+
+def build_ippo_eval_algo(observation_filter: str):
     config = (
         PPOConfig()
         .environment("MultiCell_5G_SLA_Env", env_config=ENV_CONFIG)
         .framework("torch")
         .api_stack(enable_rl_module_and_learner=True, enable_env_runner_and_connector_v2=True)
         .debugging(seed=EVAL_SEEDS[0])
-        .rl_module(model_config_dict={"fcnet_hiddens": [256, 256], "fcnet_activation": "relu"})
+        .rl_module(
+            rl_module_spec=build_initialized_rl_module_spec(
+                ENV_CONFIG["action_softmax_temperature"],
+                fcnet_hiddens=[256, 256],
+                fcnet_activation="relu",
+                initial_action_ratios=DEFAULT_INITIAL_SLICE_RATIOS,
+                initial_action_log_std=DEFAULT_INITIAL_ACTION_LOG_STD,
+            )
+        )
         .multi_agent(
             policies={"center_policy", "edge_policy"},
             policy_mapping_fn=policy_mapping_fn,
         )
-        .env_runners(observation_filter="MeanStdFilter", num_env_runners=0)
+        .env_runners(observation_filter=observation_filter, num_env_runners=0)
         .learners(num_learners=0)
     )
+    return config.build()
 
-    MAPPO_ALGO = config.build()
 
-    ranked_checkpoints = rank_checkpoints_by_metric(MAPPO_EXPERIMENT_DIRS)
-    if not ranked_checkpoints:
-        raise FileNotFoundError(
-            "No ranked checkpoint found under MAPPO seed experiment dirs. "
-            "Please run train_marl.py first."
-        )
+def stop_ippo_evaluators():
+    global IPPO_EVALUATORS
 
+    for evaluator in IPPO_EVALUATORS:
+        evaluator["algo"].stop()
+    IPPO_EVALUATORS = []
+
+
+def init_ippo_evaluators():
+    global IPPO_EVALUATORS
+
+    stop_ippo_evaluators()
+
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True)
+
+    evaluators = []
     restore_errors = []
-    for item in ranked_checkpoints:
-        checkpoint_path = item["checkpoint_path"]
-        score = item.get("episode_return_mean")
-        iteration = item.get("training_iteration")
-        urllc_violation = item.get("center_urllc_violations")
-        urllc_delay_ms = item.get("center_urllc_delay_ms")
-        print(
-            f"Trying checkpoint: {checkpoint_path} "
-            f"(iter={iteration}, urllc_viol={urllc_violation}, "
-            f"urllc_delay_ms={urllc_delay_ms}, episode_return_mean={score})"
+
+    for train_seed, experiment_dir in zip(TRAIN_SEEDS, IPPO_EXPERIMENT_DIRS):
+        ranked_checkpoints = rank_checkpoints_by_metric(
+            experiment_dir,
+            min_training_iteration=MIN_EVAL_CHECKPOINT_ITER,
+            fallback_to_any=False,
         )
-        try:
-            MAPPO_ALGO.restore(checkpoint_path)
-            print(f"Loaded MAPPO checkpoint: {checkpoint_path}")
-            return checkpoint_path
-        except Exception as exc:  # noqa: PERF203
-            restore_errors.append(f"{checkpoint_path} -> {exc}")
+        if not ranked_checkpoints:
+            restore_errors.append(
+                f"train_seed={train_seed}, experiment_dir={experiment_dir} -> "
+                f"no ranked checkpoint found with iter>={MIN_EVAL_CHECKPOINT_ITER}"
+            )
+            continue
 
-    error_preview = "\n".join(restore_errors[:3])
-    raise RuntimeError(
-        "No compatible checkpoint could be restored with current stack.\n"
-        f"Sample restore errors:\n{error_preview}"
-    )
+        restored = False
+        for item in ranked_checkpoints:
+            checkpoint_path = item["checkpoint_path"]
+            score = item.get("episode_return_mean")
+            iteration = item.get("training_iteration")
+            urllc_violation = item.get("center_urllc_violations")
+            embb_violation = item.get("center_embb_violations")
+            urllc_delay_ms = item.get("center_urllc_delay_ms")
+            quality_score = item.get("quality_score")
+            base_tp = item.get("center_reward_base_tp")
+            trial_dir = item.get("trial_dir")
+            observation_filter = _resolve_trial_observation_filter(trial_dir)
+            algo = build_ippo_eval_algo(observation_filter=observation_filter)
+
+            print(
+                f"Trying checkpoint: {checkpoint_path} "
+                f"(train_seed={train_seed}, iter={iteration}, obs_filter={observation_filter}, "
+                f"urllc_viol={urllc_violation}, embb_viol={embb_violation}, "
+                f"urllc_delay_ms={urllc_delay_ms}, base_tp={base_tp}, "
+                f"quality={quality_score}, episode_return_mean={score})"
+            )
+            try:
+                algo.restore(checkpoint_path)
+                evaluator = {
+                    "algo": algo,
+                    "train_seed": train_seed,
+                    "checkpoint_path": checkpoint_path,
+                    "training_iteration": iteration,
+                    "observation_filter": observation_filter,
+                    "center_urllc_violations": urllc_violation,
+                    "center_embb_violations": embb_violation,
+                    "center_urllc_delay_ms": urllc_delay_ms,
+                    "center_reward_base_tp": base_tp,
+                    "episode_return_mean": score,
+                    "quality_score": quality_score,
+                }
+                evaluators.append(evaluator)
+                print(
+                    f"Loaded IPPO checkpoint: {checkpoint_path} "
+                    f"(train_seed={train_seed}, obs_filter={observation_filter}, "
+                    f"quality={quality_score})"
+                )
+                restored = True
+                break
+            except Exception as exc:  # noqa: PERF203
+                algo.stop()
+                restore_errors.append(
+                    f"train_seed={train_seed}, checkpoint={checkpoint_path}, "
+                    f"obs_filter={observation_filter} -> {exc}"
+                )
+
+        if not restored:
+            print(f"Warning: no restorable checkpoint found for train_seed={train_seed}.")
+
+    if not evaluators:
+        error_preview = "\n".join(restore_errors[:5])
+        raise RuntimeError(
+            "No compatible per-seed IPPO checkpoint could be restored.\n"
+            f"Sample restore errors:\n{error_preview}"
+        )
+
+    IPPO_EVALUATORS = evaluators
+    return IPPO_EVALUATORS
 
 
-def run_evaluation(env, algo_name, seed):
-    if algo_name == "mappo" and MAPPO_ALGO is None:
-        raise RuntimeError("MAPPO_ALGO is not initialized. Call init_mappo_algo() first.")
+def run_evaluation(env, algo_name, seed, ippo_evaluator=None):
+    if algo_name == "ippo" and ippo_evaluator is None:
+        raise RuntimeError("IPPO evaluator is not initialized. Call init_ippo_evaluators() first.")
 
-    obs, _ = env.reset(seed=seed)
+    obs, reset_infos = env.reset(seed=seed)
     done = {"__all__": False}
+    ippo_runner = None
+    ippo_episode = None
+    ippo_shared_data = None
+
+    if algo_name == "ippo":
+        ippo_runner, ippo_episode, ippo_shared_data = build_ippo_episode_context(
+            ippo_evaluator["algo"], obs, reset_infos
+        )
 
     center_reward = []
+    center_reward_base_tp = []
     center_urllc_delay_ms = []
     center_embb_shortfall = []
     center_throughput_mbps = []
     system_throughput_mbps = []
+    center_penalty_total = []
+    center_penalty_embb = []
+    center_penalty_urllc = []
+    center_penalty_mmtc = []
+    center_penalty_raw_embb = []
+    center_penalty_raw_urllc = []
+    center_penalty_raw_mmtc = []
     inference_overhead_total_ms = []
     inference_overhead_per_agent_ms = []
 
@@ -212,18 +383,22 @@ def run_evaluation(env, algo_name, seed):
         actions = {}
 
         if algo_name == "static":
-            static_ratios = np.array([0.33, 0.33, 0.34], dtype=np.float32)
+            # Industrial-leaning static split: keep a small fixed mMTC slice.
+            static_ratios = np.array([0.45, 0.45, 0.10], dtype=np.float32)
             for agent in env.agents:
-                actions[agent] = ratios_to_action(static_ratios)
+                actions[agent] = ratios_to_action(static_ratios, env.action_softmax_temperature)
 
         elif algo_name == "priority":
+            urllc_priority_ratios = np.array([0.08333333, 0.8333333, 0.08333333], dtype=np.float32)
+            embb_priority_ratios = np.array([0.72, 0.20, 0.08], dtype=np.float32)
             for agent in env.agents:
                 if env.queues[agent][1] > 0.05:
-                    actions[agent] = np.array([-0.8, 1.0, -0.8], dtype=np.float32)
+                    actions[agent] = ratios_to_action(urllc_priority_ratios, env.action_softmax_temperature)
                 else:
-                    actions[agent] = np.array([0.8, -0.5, -0.8], dtype=np.float32)
+                    actions[agent] = ratios_to_action(embb_priority_ratios, env.action_softmax_temperature)
 
         elif algo_name == "max_weight":
+            # Throughput-oriented heuristic: queue backlog weighted by instant SE.
             for agent in env.agents:
                 queue_vec = np.maximum(env.queues[agent], 0.0)
                 se_vec = np.maximum(env.current_se[agent], 0.0)
@@ -231,7 +406,7 @@ def run_evaluation(env, algo_name, seed):
                 if float(np.sum(weights)) <= EPS:
                     weights = np.array([1.0, 1.0, 1.0], dtype=np.float32)
                 ratios = weights / np.sum(weights)
-                actions[agent] = ratios_to_action(ratios)
+                actions[agent] = ratios_to_action(ratios, env.action_softmax_temperature)
 
         elif algo_name == "pf":
             for agent in env.agents:
@@ -241,20 +416,37 @@ def run_evaluation(env, algo_name, seed):
                 if float(np.sum(weights)) <= EPS:
                     weights = np.array([1.0, 1.0, 1.0], dtype=np.float32)
                 ratios = weights / np.sum(weights)
-                actions[agent] = ratios_to_action(ratios)
+                actions[agent] = ratios_to_action(ratios, env.action_softmax_temperature)
 
-        elif algo_name == "mappo":
+        elif algo_name == "ippo":
             start = time.perf_counter()
-            actions = compute_actions_batched_new_stack(MAPPO_ALGO, obs)
+            policy_actions, actions, extra_model_outputs = compute_actions_batched(
+                ippo_evaluator["algo"],
+                ippo_runner,
+                ippo_episode,
+                ippo_shared_data,
+            )
             end = time.perf_counter()
             elapsed_ms = (end - start) * 1000.0
             inference_overhead_total_ms.append(elapsed_ms)
             inference_overhead_per_agent_ms.append(elapsed_ms / max(len(obs), 1))
-
         else:
+            extra_model_outputs = None
+
+        if algo_name not in {"static", "priority", "max_weight", "pf", "ippo"}:
             raise ValueError(f"Unknown algorithm name: {algo_name}")
 
         obs, rewards, terminateds, truncateds, infos = env.step(actions)
+        if algo_name == "ippo":
+            ippo_episode.add_env_step(
+                obs,
+                policy_actions,
+                rewards,
+                infos=infos,
+                terminateds=terminateds,
+                truncateds=truncateds,
+                extra_model_outputs=extra_model_outputs,
+            )
 
         step_system_tp_mbps = 0.0
         for agent in env.agents:
@@ -278,11 +470,37 @@ def run_evaluation(env, algo_name, seed):
                     PF_MA_ALPHA * pf_avg_throughput[agent] + (1.0 - PF_MA_ALPHA) * inst_tp
                 )
 
+        center_info = infos["BS_0"]
+        penalties_clipped = np.asarray(center_info.get("penalties", np.zeros(3, dtype=np.float32)), dtype=np.float32)
+        penalties_raw = np.asarray(center_info.get("penalty_raw", penalties_clipped), dtype=np.float32)
+
+        if env.reward_mode == "binary_sla_reward":
+            throughput_reward_weight = 1.0 / max(env.binary_reward_throughput_scale, 1e-6)
+        elif env.reward_mode == "simple_local_sla":
+            throughput_reward_weight = env.simple_reward_throughput_weight
+        else:
+            throughput_reward_weight = env.tail_reward_throughput_weight
+        reward_base_tp = float(
+            center_info.get("reward_base_tp", center_info["throughput"] * throughput_reward_weight)
+        )
+        penalty_embb = float(center_info.get("penalty_embb", penalties_clipped[0]))
+        penalty_urllc = float(center_info.get("penalty_urllc", penalties_clipped[1]))
+        penalty_mmtc = float(center_info.get("penalty_mmtc", penalties_clipped[2]))
+        penalty_total = float(center_info.get("penalty_total", penalty_embb + penalty_urllc + penalty_mmtc))
+
         center_reward.append(float(rewards["BS_0"]))
-        center_urllc_delay_ms.append(float(infos["BS_0"]["est_urllc_delay"] * 1000.0))
+        center_reward_base_tp.append(reward_base_tp)
+        center_urllc_delay_ms.append(float(center_info["est_urllc_delay"] * 1000.0))
         center_embb_shortfall.append(float(env.state["BS_0"][13]))
-        center_throughput_mbps.append(float(infos["BS_0"]["throughput"]))
+        center_throughput_mbps.append(float(center_info["throughput"]))
         system_throughput_mbps.append(step_system_tp_mbps)
+        center_penalty_total.append(penalty_total)
+        center_penalty_embb.append(penalty_embb)
+        center_penalty_urllc.append(penalty_urllc)
+        center_penalty_mmtc.append(penalty_mmtc)
+        center_penalty_raw_embb.append(float(center_info.get("penalty_raw_embb", penalties_raw[0])))
+        center_penalty_raw_urllc.append(float(center_info.get("penalty_raw_urllc", penalties_raw[1])))
+        center_penalty_raw_mmtc.append(float(center_info.get("penalty_raw_mmtc", penalties_raw[2])))
 
         done = terminateds
         steps += 1
@@ -294,11 +512,19 @@ def run_evaluation(env, algo_name, seed):
 
     result = {
         "reward": np.asarray(center_reward, dtype=np.float32),
+        "reward_base_tp": np.asarray(center_reward_base_tp, dtype=np.float32),
         "cum_reward": np.cumsum(np.asarray(center_reward, dtype=np.float32)),
         "urllc_delay_ms": np.asarray(center_urllc_delay_ms, dtype=np.float32),
         "embb_shortfall": np.asarray(center_embb_shortfall, dtype=np.float32),
         "center_throughput_mbps": np.asarray(center_throughput_mbps, dtype=np.float32),
         "system_throughput_mbps": np.asarray(system_throughput_mbps, dtype=np.float32),
+        "penalty_total": np.asarray(center_penalty_total, dtype=np.float32),
+        "penalty_embb": np.asarray(center_penalty_embb, dtype=np.float32),
+        "penalty_urllc": np.asarray(center_penalty_urllc, dtype=np.float32),
+        "penalty_mmtc": np.asarray(center_penalty_mmtc, dtype=np.float32),
+        "penalty_raw_embb": np.asarray(center_penalty_raw_embb, dtype=np.float32),
+        "penalty_raw_urllc": np.asarray(center_penalty_raw_urllc, dtype=np.float32),
+        "penalty_raw_mmtc": np.asarray(center_penalty_raw_mmtc, dtype=np.float32),
         "sla_sys_success_rate": np.asarray(sla_sys_success, dtype=np.float64),
         "sla_bs0_success_rate": np.asarray(sla_bs0_success, dtype=np.float64),
         "jfi_embb": float(jfi_embb),
@@ -312,6 +538,9 @@ def run_evaluation(env, algo_name, seed):
             float(np.mean(inference_overhead_per_agent_ms)) if inference_overhead_per_agent_ms else np.nan
         ),
     }
+    if algo_name == "ippo":
+        result["train_seed"] = int(ippo_evaluator["train_seed"])
+        result["checkpoint_path"] = str(ippo_evaluator["checkpoint_path"])
     return result
 
 
@@ -327,11 +556,19 @@ def stack_metric(run_list, metric_key):
 def aggregate_results(results_by_algo):
     aggregated = {}
     for algo_key, run_list in results_by_algo.items():
+        reward_base_tp = stack_metric(run_list, "reward_base_tp")
         delay = stack_metric(run_list, "urllc_delay_ms")
         cum_reward = stack_metric(run_list, "cum_reward")
         shortfall = stack_metric(run_list, "embb_shortfall")
         center_tp = stack_metric(run_list, "center_throughput_mbps")
         system_tp = stack_metric(run_list, "system_throughput_mbps")
+        penalty_total = stack_metric(run_list, "penalty_total")
+        penalty_embb = stack_metric(run_list, "penalty_embb")
+        penalty_urllc = stack_metric(run_list, "penalty_urllc")
+        penalty_mmtc = stack_metric(run_list, "penalty_mmtc")
+        penalty_raw_embb = stack_metric(run_list, "penalty_raw_embb")
+        penalty_raw_urllc = stack_metric(run_list, "penalty_raw_urllc")
+        penalty_raw_mmtc = stack_metric(run_list, "penalty_raw_mmtc")
 
         fairness = np.asarray([run["jfi_embb"] for run in run_list], dtype=np.float64)
         inf_total_ms = np.asarray([run["mean_inference_total_ms"] for run in run_list], dtype=np.float64)
@@ -343,7 +580,16 @@ def aggregate_results(results_by_algo):
         sla_sys = np.asarray([run["sla_sys_success_rate"] for run in run_list], dtype=np.float64)
         sla_bs0 = np.asarray([run["sla_bs0_success_rate"] for run in run_list], dtype=np.float64)
 
+        penalty_embb_scalar = float(np.nanmean(penalty_embb))
+        penalty_urllc_scalar = float(np.nanmean(penalty_urllc))
+        penalty_mmtc_scalar = float(np.nanmean(penalty_mmtc))
+        penalty_total_scalar = float(np.nanmean(penalty_total))
+        penalty_share_denom = max(penalty_embb_scalar + penalty_urllc_scalar + penalty_mmtc_scalar, 1e-8)
+
         aggregated[algo_key] = {
+            "num_runs": len(run_list),
+            "reward_base_tp_mean": np.nanmean(reward_base_tp, axis=0),
+            "reward_base_tp_std": np.nanstd(reward_base_tp, axis=0),
             "delay_mean": np.nanmean(delay, axis=0),
             "delay_std": np.nanstd(delay, axis=0),
             "cum_reward_mean": np.nanmean(cum_reward, axis=0),
@@ -354,6 +600,24 @@ def aggregate_results(results_by_algo):
             "center_tp_std": np.nanstd(center_tp, axis=0),
             "system_tp_mean": np.nanmean(system_tp, axis=0),
             "system_tp_std": np.nanstd(system_tp, axis=0),
+            "penalty_total_mean": np.nanmean(penalty_total, axis=0),
+            "penalty_total_std": np.nanstd(penalty_total, axis=0),
+            "penalty_embb_mean": np.nanmean(penalty_embb, axis=0),
+            "penalty_embb_std": np.nanstd(penalty_embb, axis=0),
+            "penalty_urllc_mean": np.nanmean(penalty_urllc, axis=0),
+            "penalty_urllc_std": np.nanstd(penalty_urllc, axis=0),
+            "penalty_mmtc_mean": np.nanmean(penalty_mmtc, axis=0),
+            "penalty_mmtc_std": np.nanstd(penalty_mmtc, axis=0),
+            "penalty_raw_embb_mean": np.nanmean(penalty_raw_embb, axis=0),
+            "penalty_raw_urllc_mean": np.nanmean(penalty_raw_urllc, axis=0),
+            "penalty_raw_mmtc_mean": np.nanmean(penalty_raw_mmtc, axis=0),
+            "penalty_embb_scalar": penalty_embb_scalar,
+            "penalty_urllc_scalar": penalty_urllc_scalar,
+            "penalty_mmtc_scalar": penalty_mmtc_scalar,
+            "penalty_total_scalar": penalty_total_scalar,
+            "penalty_share_embb": penalty_embb_scalar / penalty_share_denom,
+            "penalty_share_urllc": penalty_urllc_scalar / penalty_share_denom,
+            "penalty_share_mmtc": penalty_mmtc_scalar / penalty_share_denom,
             "fairness_mean": float(np.nanmean(fairness)),
             "fairness_std": float(np.nanstd(fairness)),
             "inference_total_ms_mean": (
@@ -389,29 +653,54 @@ def plot_with_band(ax, x_axis, mean, std, label, color):
 
 
 def run_baselines():
-    print("Initializing MAPPO checkpoint...")
-    loaded_checkpoint = init_mappo_algo()
-    print(f"Using checkpoint: {loaded_checkpoint}")
+    validate_seed_split()
+    print(f"Initializing IPPO checkpoints by training seed (min_iter={MIN_EVAL_CHECKPOINT_ITER})...")
+    ippo_evaluators = init_ippo_evaluators()
+    print("Loaded IPPO evaluators:")
+    for evaluator in ippo_evaluators:
+        print(
+            f"  train_seed={evaluator['train_seed']}, "
+            f"iter={evaluator['training_iteration']}, "
+            f"obs_filter={evaluator['observation_filter']}, "
+            f"quality={evaluator['quality_score']}, "
+            f"checkpoint={evaluator['checkpoint_path']}"
+        )
 
     results_by_algo = {key: [] for key, _ in ALGORITHMS}
 
     for seed in EVAL_SEEDS:
         print(f"\n=== Evaluation seed={seed} ===")
         for algo_key, algo_label in ALGORITHMS:
-            env = MultiCell_5G_SLA_Env(config=ENV_CONFIG)
-            run = run_evaluation(env, algo_key, seed)
-            results_by_algo[algo_key].append(run)
+            if algo_key != "ippo":
+                env = MultiCell_5G_SLA_Env(config=ENV_CONFIG)
+                run = run_evaluation(env, algo_key, seed)
+                results_by_algo[algo_key].append(run)
 
-            print(
-                f"[{algo_label}] "
-                f"JFI={run['jfi_embb']:.4f}, "
-                f"sys_tp_mean={np.mean(run['system_throughput_mbps']):.2f} Mbps, "
-                f"mean_delay_ms={np.mean(run['urllc_delay_ms']):.3f}, "
-                f"cum_reward={run['cum_reward'][-1]:.3f}"
-            )
-            if algo_key == "mappo":
                 print(
                     f"[{algo_label}] "
+                    f"JFI={run['jfi_embb']:.4f}, "
+                    f"sys_tp_mean={np.mean(run['system_throughput_mbps']):.2f} Mbps, "
+                    f"mean_delay_ms={np.mean(run['urllc_delay_ms']):.3f}, "
+                    f"cum_reward={run['cum_reward'][-1]:.3f}"
+                )
+                continue
+
+            for evaluator in ippo_evaluators:
+                env = MultiCell_5G_SLA_Env(config=ENV_CONFIG)
+                run = run_evaluation(env, algo_key, seed, ippo_evaluator=evaluator)
+                results_by_algo[algo_key].append(run)
+
+                print(
+                    f"[{algo_label}] "
+                    f"train_seed={evaluator['train_seed']}, "
+                    f"JFI={run['jfi_embb']:.4f}, "
+                    f"sys_tp_mean={np.mean(run['system_throughput_mbps']):.2f} Mbps, "
+                    f"mean_delay_ms={np.mean(run['urllc_delay_ms']):.3f}, "
+                    f"cum_reward={run['cum_reward'][-1]:.3f}"
+                )
+                print(
+                    f"[{algo_label}] "
+                    f"train_seed={evaluator['train_seed']}, "
                     f"inference_total={run['mean_inference_total_ms']:.4f} ms, "
                     f"inference_per_agent={run['mean_inference_per_agent_ms']:.4f} ms, "
                     f"inference_p95_total={run['p95_inference_total_ms']:.4f} ms"
@@ -419,8 +708,13 @@ def run_baselines():
 
     aggregated = aggregate_results(results_by_algo)
 
-    print("\n=== Summary over 4 seeds (mean ± std) ===")
-    for algo_key, algo_label in ALGORITHMS:
+    print("\n=== Summary (mean ± std over recorded runs) ===")
+    print(
+        f"Heuristic baselines use {len(EVAL_SEEDS)} evaluation seeds each; "
+        f"IPPO uses {len(ippo_evaluators)} training-seed checkpoints x {len(EVAL_SEEDS)} "
+        f"evaluation seeds = {len(results_by_algo['ippo'])} runs."
+    )
+    for algo_key, algo_label in main_comparison_algorithms():
         stats = aggregated[algo_key]
         fairness_text = f"JFI={stats['fairness_mean']:.4f} ± {stats['fairness_std']:.4f}"
         sys_tp_text = f"SysTP={np.mean(stats['system_tp_mean']):.2f} Mbps"
@@ -432,9 +726,31 @@ def run_baselines():
             f"{stats['sla_sys_mean'][1]*100:.1f}%/"
             f"{stats['sla_sys_mean'][2]*100:.1f}%"
         )
-        print(f"{algo_label:>20}: {fairness_text}, {sys_tp_text}, {delay_text}, {reward_text}")
+        penalty_text = (
+            "Penalty[total/eMBB/URLLC/mMTC]="
+            f"{stats['penalty_total_scalar']:.3f}/"
+            f"{stats['penalty_embb_scalar']:.3f}/"
+            f"{stats['penalty_urllc_scalar']:.3f}/"
+            f"{stats['penalty_mmtc_scalar']:.3f}"
+        )
+        penalty_share_text = (
+            "PenaltyShare[eMBB/URLLC/mMTC]="
+            f"{stats['penalty_share_embb']*100:.1f}%/"
+            f"{stats['penalty_share_urllc']*100:.1f}%/"
+            f"{stats['penalty_share_mmtc']*100:.1f}%"
+        )
+        reward_base_text = (
+            "BaseTPReward="
+            f"{np.mean(stats['reward_base_tp_mean']):.3f}"
+        )
+        print(
+            f"{algo_label:>20}: runs={stats['num_runs']}, "
+            f"{fairness_text}, {sys_tp_text}, {delay_text}, {reward_text}"
+        )
         print(f"{' ':>22}{sla_sys_text}")
-        if algo_key == "mappo":
+        print(f"{' ':>22}{reward_base_text}, {penalty_text}")
+        print(f"{' ':>22}{penalty_share_text}")
+        if algo_key == "ippo":
             print(
                 " " * 22
                 + "Inference total="
@@ -450,7 +766,7 @@ def run_baselines():
     fig, axes = plt.subplots(3, 2, figsize=(18, 15))
 
     ax1 = axes[0, 0]
-    for algo_key, algo_label in ALGORITHMS:
+    for algo_key, algo_label in main_comparison_algorithms():
         stats = aggregated[algo_key]
         plot_with_band(
             ax1,
@@ -468,7 +784,7 @@ def run_baselines():
     ax1.legend()
 
     ax2 = axes[0, 1]
-    for algo_key, algo_label in ALGORITHMS:
+    for algo_key, algo_label in main_comparison_algorithms():
         stats = aggregated[algo_key]
         plot_with_band(
             ax2,
@@ -485,7 +801,7 @@ def run_baselines():
     ax2.legend()
 
     ax3 = axes[1, 0]
-    for algo_key, algo_label in ALGORITHMS:
+    for algo_key, algo_label in main_comparison_algorithms():
         stats = aggregated[algo_key]
         plot_with_band(
             ax3,
@@ -519,25 +835,26 @@ def run_baselines():
     ax4.legend()
 
     ax5 = axes[2, 0]
-    labels = [label for _, label in ALGORITHMS]
-    fairness_means = [aggregated[key]["fairness_mean"] for key, _ in ALGORITHMS]
-    fairness_stds = [aggregated[key]["fairness_std"] for key, _ in ALGORITHMS]
-    bars = ax5.bar(labels, fairness_means, yerr=fairness_stds, capsize=4.0, color=[PLOT_COLORS[k] for k, _ in ALGORITHMS])
+    comparison_algos = main_comparison_algorithms()
+    labels = [label for _, label in comparison_algos]
+    fairness_means = [aggregated[key]["fairness_mean"] for key, _ in comparison_algos]
+    fairness_stds = [aggregated[key]["fairness_std"] for key, _ in comparison_algos]
+    bars = ax5.bar(labels, fairness_means, yerr=fairness_stds, capsize=4.0, color=[PLOT_COLORS[k] for k, _ in comparison_algos])
     ax5.set_title("Jain Fairness Index (eMBB Throughput)")
     ax5.set_ylabel("JFI")
     ax5.set_ylim(0.0, 1.05)
     ax5.grid(True, axis="y")
     ax5.tick_params(axis="x", rotation=20)
 
-    mappo_stats = aggregated["mappo"]
+    ippo_stats = aggregated["ippo"]
     ax5.text(
         0.02,
         0.92,
         (
-            "MAPPO inference overhead:\n"
-            f"total={mappo_stats['inference_total_ms_mean']:.4f} ms\n"
-            f"per-agent={mappo_stats['inference_per_agent_ms_mean']:.4f} ms\n"
-            f"p95(total)={mappo_stats['inference_p95_total_ms_mean']:.4f} ms"
+            "IPPO inference overhead:\n"
+            f"total={ippo_stats['inference_total_ms_mean']:.4f} ms\n"
+            f"per-agent={ippo_stats['inference_per_agent_ms_mean']:.4f} ms\n"
+            f"p95(total)={ippo_stats['inference_p95_total_ms_mean']:.4f} ms"
         ),
         transform=ax5.transAxes,
         verticalalignment="top",
@@ -555,11 +872,11 @@ def run_baselines():
         )
 
     ax6 = axes[2, 1]
-    x_idx = np.arange(len(ALGORITHMS))
+    x_idx = np.arange(len(comparison_algos))
     width = 0.25
-    embb_sla = np.array([aggregated[key]["sla_sys_mean"][0] for key, _ in ALGORITHMS], dtype=np.float64)
-    urllc_sla = np.array([aggregated[key]["sla_sys_mean"][1] for key, _ in ALGORITHMS], dtype=np.float64)
-    mmtc_sla = np.array([aggregated[key]["sla_sys_mean"][2] for key, _ in ALGORITHMS], dtype=np.float64)
+    embb_sla = np.array([aggregated[key]["sla_sys_mean"][0] for key, _ in comparison_algos], dtype=np.float64)
+    urllc_sla = np.array([aggregated[key]["sla_sys_mean"][1] for key, _ in comparison_algos], dtype=np.float64)
+    mmtc_sla = np.array([aggregated[key]["sla_sys_mean"][2] for key, _ in comparison_algos], dtype=np.float64)
 
     ax6.bar(x_idx - width, embb_sla, width=width, label="eMBB SLA success", color="#1f77b4")
     ax6.bar(x_idx, urllc_sla, width=width, label="URLLC SLA success", color="#ff7f0e")
@@ -574,12 +891,11 @@ def run_baselines():
 
     os.makedirs("./results", exist_ok=True)
     plt.tight_layout()
-    output_path = "./results/marl_baseline_comparison_multiseed.png"
+    output_path = f"./results/marl_baseline_comparison_{ENV_PROFILE}_multiseed.png"
     plt.savefig(output_path)
     print(f"Saved comparison plots to {output_path}")
 
-    if MAPPO_ALGO is not None:
-        MAPPO_ALGO.stop()
+    stop_ippo_evaluators()
     if ray.is_initialized():
         ray.shutdown()
 

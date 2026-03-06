@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import pickle
 from glob import glob
@@ -15,12 +16,21 @@ def _extract_metrics(record):
 
     center_urllc_viol = custom_metrics.get("center_urllc_violations")
     center_urllc_delay_ms = custom_metrics.get("center_urllc_delay_ms")
+    center_embb_viol = custom_metrics.get("center_embb_violations")
+    center_embb_sla_ok = custom_metrics.get("center_embb_sla_ok")
+    center_urllc_sla_ok = custom_metrics.get("center_urllc_sla_ok")
+    center_reward_base_tp = custom_metrics.get("center_reward_base_tp")
 
     metrics = {
         "episode_return_mean": float(episode_return_mean) if episode_return_mean is not None else None,
         "center_urllc_violations": float(center_urllc_viol) if center_urllc_viol is not None else None,
         "center_urllc_delay_ms": float(center_urllc_delay_ms) if center_urllc_delay_ms is not None else None,
+        "center_embb_violations": float(center_embb_viol) if center_embb_viol is not None else None,
+        "center_embb_sla_ok": float(center_embb_sla_ok) if center_embb_sla_ok is not None else None,
+        "center_urllc_sla_ok": float(center_urllc_sla_ok) if center_urllc_sla_ok is not None else None,
+        "center_reward_base_tp": float(center_reward_base_tp) if center_reward_base_tp is not None else None,
     }
+    metrics["quality_score"] = _compute_quality_score(metrics)
     return metrics
 
 
@@ -107,25 +117,86 @@ def _normalize_experiment_dirs(experiment_dirs):
     return uniq
 
 
+def _normalize_base_tp(base_tp):
+    if base_tp is None:
+        return None
+    return max(0.0, min(float(base_tp), 1.0))
+
+
+def _normalize_violation(violation, decay):
+    if violation is None:
+        return None
+    violation = max(float(violation), 0.0)
+    return math.exp(-decay * violation)
+
+
+def _normalize_urllc_delay(delay_ms, budget_ms=2.0, decay=1.0):
+    if delay_ms is None:
+        return None
+    delay_ms = max(float(delay_ms), 0.0)
+    delay_excess_ms = max(delay_ms - budget_ms, 0.0)
+    return math.exp(-decay * delay_excess_ms)
+
+
+def _normalize_episode_return(episode_return_mean, scale=1000.0):
+    if episode_return_mean is None:
+        return None
+    return 0.5 * (1.0 + math.tanh(float(episode_return_mean) / scale))
+
+
+def _compute_quality_score(metrics):
+    # Conservative checkpoint ranking:
+    # URLLC feasibility dominates, eMBB and delay come next,
+    # throughput proxy and return only act as secondary tie-break quality terms.
+    urllc_quality = _normalize_violation(metrics.get("center_urllc_violations"), decay=4.0)
+    embb_quality = _normalize_violation(metrics.get("center_embb_violations"), decay=2.0)
+    urllc_delay_quality = _normalize_urllc_delay(metrics.get("center_urllc_delay_ms"))
+    base_tp_norm = _normalize_base_tp(metrics.get("center_reward_base_tp"))
+    return_quality = _normalize_episode_return(metrics.get("episode_return_mean"))
+
+    components = [
+        (0.45, urllc_quality),
+        (0.25, embb_quality),
+        (0.10, urllc_delay_quality),
+        (0.10, base_tp_norm),
+        (0.10, return_quality),
+    ]
+    available = [(weight, value) for weight, value in components if value is not None]
+    if not available:
+        return None
+
+    total_weight = sum(weight for weight, _ in available)
+    weighted_sum = sum(weight * value for weight, value in available)
+    return weighted_sum / total_weight
+
+
 def _ranking_key(item):
-    # Lower URLLC violation first, then lower delay, then higher return.
+    # Conservative selection: prioritize SLA feasibility first, then throughput proxy.
+    quality = item.get("quality_score")
     viol = item.get("center_urllc_violations")
+    embb_viol = item.get("center_embb_violations")
     delay = item.get("center_urllc_delay_ms")
+    base_tp = item.get("center_reward_base_tp")
     ret = item.get("episode_return_mean")
     iter_ = item.get("training_iteration", -1)
 
     return (
+        0 if quality is not None else 1,
+        -(quality if quality is not None else float("-inf")),
         0 if viol is not None else 1,
         viol if viol is not None else float("inf"),
         0 if delay is not None else 1,
         delay if delay is not None else float("inf"),
+        0 if embb_viol is not None else 1,
+        embb_viol if embb_viol is not None else float("inf"),
+        -(base_tp if base_tp is not None else float("-inf")),
         -(ret if ret is not None else float("-inf")),
         -iter_,
         -item.get("ctime", 0.0),
     )
 
 
-def rank_checkpoints_by_metric(experiment_dirs):
+def _collect_ranked_checkpoints(experiment_dirs, min_training_iteration):
     ranked = []
     for exp_dir_str in _normalize_experiment_dirs(experiment_dirs):
         exp_dir = Path(exp_dir_str)
@@ -146,6 +217,8 @@ def rank_checkpoints_by_metric(experiment_dirs):
                 training_iteration = _read_checkpoint_iteration(checkpoint_dir)
                 if training_iteration is None:
                     continue
+                if training_iteration < min_training_iteration:
+                    continue
 
                 metrics = metrics_by_iteration.get(training_iteration)
                 if metrics is None:
@@ -158,6 +231,11 @@ def rank_checkpoints_by_metric(experiment_dirs):
                         "episode_return_mean": metrics.get("episode_return_mean"),
                         "center_urllc_violations": metrics.get("center_urllc_violations"),
                         "center_urllc_delay_ms": metrics.get("center_urllc_delay_ms"),
+                        "center_embb_violations": metrics.get("center_embb_violations"),
+                        "center_embb_sla_ok": metrics.get("center_embb_sla_ok"),
+                        "center_urllc_sla_ok": metrics.get("center_urllc_sla_ok"),
+                        "center_reward_base_tp": metrics.get("center_reward_base_tp"),
+                        "quality_score": metrics.get("quality_score"),
                         "experiment_dir": str(exp_dir),
                         "trial_dir": str(trial_dir),
                         "ctime": os.path.getctime(checkpoint_dir),
@@ -166,3 +244,10 @@ def rank_checkpoints_by_metric(experiment_dirs):
 
     ranked.sort(key=_ranking_key)
     return ranked
+
+
+def rank_checkpoints_by_metric(experiment_dirs, min_training_iteration=0, fallback_to_any=False):
+    ranked = _collect_ranked_checkpoints(experiment_dirs, min_training_iteration=min_training_iteration)
+    if ranked or not fallback_to_any or min_training_iteration <= 0:
+        return ranked
+    return _collect_ranked_checkpoints(experiment_dirs, min_training_iteration=0)
