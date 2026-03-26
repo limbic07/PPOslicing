@@ -17,7 +17,6 @@ from checkpoint_utils import rank_checkpoints_by_metric
 from ippo_rl_module import (
     CENTRALIZED_CRITIC_GLOBAL_DIM,
     DEFAULT_INITIAL_ACTION_LOG_STD,
-    DEFAULT_INITIAL_SLICE_RATIOS,
     build_initialized_rl_module_spec,
 )
 from multi_cell_env import MultiCell_5G_SLA_Env
@@ -33,23 +32,33 @@ TRAIN_SEEDS = [2026, 2027, 2028]
 EVAL_SEEDS = [3026, 3027, 3028, 3029]
 ENV_PROFILE = "balanced"
 MIN_EVAL_CHECKPOINT_ITER = 50
+LEARNED_SELECTION_MODE = "eval_sweep_system_total_sla"
+BASE_PROFILE_OVERRIDES = MultiCell_5G_SLA_Env._get_env_profile_overrides(ENV_PROFILE)
 
 LEARNED_METHODS = [
     {
         "algo_key": "ippo",
         "label": "IPPO (Baseline, pure_local)",
-        "experiment_env_tag": "balanced_ippo_v1",
+        "experiment_env_tag": "balanced_ippo_v5",
         "observation_mode": "pure_local",
         "use_centralized_critic": False,
         "cooperative_alpha": 1.0,
+        "neighbor_liability_beta": 0.0,
+        "neighbor_dividend_gamma": 0.0,
+        "cooperative_target": "all",
+        "neighbor_augmented_include_ici_features": False,
     },
     {
         "algo_key": "mappo",
         "label": "MAPPO (Proposed, CTDE)",
-        "experiment_env_tag": "balanced_mappo_ctde_v1",
+        "experiment_env_tag": "balanced_mappo_ctde_v5",
         "observation_mode": "neighbor_augmented",
         "use_centralized_critic": True,
-        "cooperative_alpha": 0.7,
+        "cooperative_alpha": None,
+        "neighbor_liability_beta": None,
+        "neighbor_dividend_gamma": None,
+        "cooperative_target": "all",
+        "neighbor_augmented_include_ici_features": False,
     },
 ]
 LEARNED_METHOD_BY_KEY = {item["algo_key"]: item for item in LEARNED_METHODS}
@@ -72,62 +81,43 @@ PLOT_COLORS = {
     "mappo": "#8c564b",
 }
 
+DELAY_PLOT_SCALE_EXCLUDE_ALGOS = {"max_weight"}
+DELAY_PLOT_SCALE_PERCENTILE = 98.0
+DELAY_PLOT_SCALE_MARGIN = 1.20
+DELAY_PLOT_MIN_UPPER_MS = 2.5
+
 BASE_ENV_CONFIG = {
     "env_profile": ENV_PROFILE,
-    "action_softmax_temperature": 3.0,
-    "penalty_weight": 0.7,
-    "w_embb": 1.0,
-    "w_urllc": 0.30,
-    "w_mmtc": 0.7,
-    "urllc_warning_ratio": 0.90,
-    "urllc_tail_ratio": 0.92,
-    "urllc_softplus_slope": 10.0,
-    "urllc_warning_gain": 0.20,
-    "urllc_tail_quad_gain": 2.0,
-    "urllc_hard_violation_gain": 1.75,
-    "urllc_overflow_gain": 2.2,
-    "urllc_exp_coeff": 1.6,
-    "urllc_penalty_cap_factor": 10.0,
-    "embb_penalty_quad_gain": 2.5,
-    "embb_penalty_cubic_gain": 1.2,
-    "embb_penalty_cap_factor": 16.0,
-    "mmtc_penalty_cap_factor": 5.0,
-    "embb_violation_cap": 2.0,
-    "urllc_violation_cap": 5.0,
-    "mmtc_violation_cap": 2.0,
-    "embb_gbr": 220.0,
-    "urllc_burst_start_prob": 0.06,
-    "urllc_burst_end_prob": 0.35,
-    "urllc_burst_mean_mbps": 100.0,
-    "urllc_burst_std_mbps": 15.0,
-    "binary_reward_throughput_scale": 80.0,
-    "binary_penalty_embb": 4.0,
-    "binary_penalty_urllc": 6.0,
-    "binary_penalty_mmtc": 4.0,
-    "binary_urllc_yellow_start_ratio": 0.5,
-    "binary_urllc_yellow_penalty": 6.0,
-    "tail_reward_throughput_weight": 1.0 / 300.0,
-    "center_reward_scale": 1.0,
-    "reward_clip_abs": 0.0,
+    "action_softmax_temperature": float(BASE_PROFILE_OVERRIDES.get("action_softmax_temperature", 1.0)),
 }
 
 HEURISTIC_ENV_CONFIG = {
     **BASE_ENV_CONFIG,
     "observation_mode": "pure_local",
     "use_centralized_critic": False,
-    "cooperative_alpha": 0.7,
 }
 
-LEARNED_ENV_CONFIGS = {
-    method["algo_key"]: {
+def _build_learned_env_config(method):
+    env_cfg = {
         **BASE_ENV_CONFIG,
         "observation_mode": method["observation_mode"],
         "use_centralized_critic": method["use_centralized_critic"],
-        "cooperative_alpha": method["cooperative_alpha"],
         "centralized_critic_global_dim": CENTRALIZED_CRITIC_GLOBAL_DIM,
     }
-    for method in LEARNED_METHODS
-}
+    if method["cooperative_alpha"] is not None:
+        env_cfg["cooperative_alpha"] = method["cooperative_alpha"]
+    if method["neighbor_liability_beta"] is not None:
+        env_cfg["neighbor_liability_beta"] = method["neighbor_liability_beta"]
+    if method["neighbor_dividend_gamma"] is not None:
+        env_cfg["neighbor_dividend_gamma"] = method["neighbor_dividend_gamma"]
+    env_cfg["cooperative_target"] = method.get("cooperative_target", "all")
+    env_cfg["neighbor_augmented_include_ici_features"] = bool(
+        method.get("neighbor_augmented_include_ici_features", False)
+    )
+    return env_cfg
+
+
+LEARNED_ENV_CONFIGS = {method["algo_key"]: _build_learned_env_config(method) for method in LEARNED_METHODS}
 
 LEARNED_EXPERIMENT_DIRS = {
     method["algo_key"]: [
@@ -270,10 +260,10 @@ def build_learned_eval_algo(observation_filter: str, env_config: dict):
             rl_module_spec=build_initialized_rl_module_spec(
                 env_config["action_softmax_temperature"],
                 fcnet_hiddens=[256, 256],
-                fcnet_activation="relu",
-                initial_action_ratios=DEFAULT_INITIAL_SLICE_RATIOS,
+                fcnet_activation="tanh",
                 initial_action_log_std=DEFAULT_INITIAL_ACTION_LOG_STD,
                 observation_mode=env_config["observation_mode"],
+                include_ici_features=bool(env_config.get("neighbor_augmented_include_ici_features", False)),
                 use_centralized_critic=bool(env_config.get("use_centralized_critic", False)),
                 critic_global_dim=int(env_config.get("centralized_critic_global_dim", CENTRALIZED_CRITIC_GLOBAL_DIM)),
             )
@@ -286,6 +276,62 @@ def build_learned_eval_algo(observation_filter: str, env_config: dict):
         .learners(num_learners=0)
     )
     return config.build()
+
+
+def summarize_eval_stats(aggregated_algo_stats):
+    return {
+        "system_total_sla_violations": float(np.sum(1.0 - aggregated_algo_stats["sla_sys_mean"])),
+        "bs0_total_sla_violations": float(np.sum(1.0 - aggregated_algo_stats["sla_bs0_mean"])),
+        "system_tp_mean_mbps": float(np.mean(aggregated_algo_stats["system_tp_mean"])),
+        "delay_mean_ms": float(np.mean(aggregated_algo_stats["delay_mean"])),
+        "final_cum_reward": float(aggregated_algo_stats["cum_reward_mean"][-1]),
+        "sla_sys_mean": aggregated_algo_stats["sla_sys_mean"].tolist(),
+        "sla_bs0_mean": aggregated_algo_stats["sla_bs0_mean"].tolist(),
+    }
+
+
+def candidate_eval_key(summary, training_iteration):
+    return (
+        summary["system_total_sla_violations"],
+        -summary["system_tp_mean_mbps"],
+        -summary["sla_sys_mean"][0],
+        -summary["sla_bs0_mean"][0],
+        -summary["final_cum_reward"],
+        -training_iteration,
+    )
+
+
+def evaluate_learned_checkpoint_candidate(method, candidate):
+    algo_key = method["algo_key"]
+    env_config = LEARNED_ENV_CONFIGS[algo_key]
+    observation_filter = _resolve_trial_observation_filter(candidate["trial_dir"])
+    algo = build_learned_eval_algo(observation_filter=observation_filter, env_config=env_config)
+    algo.restore(candidate["checkpoint_path"])
+
+    evaluator = {
+        "algo_key": algo_key,
+        "label": method["label"],
+        "algo": algo,
+        "env_config": dict(env_config),
+        "train_seed": candidate.get("train_seed", TRAIN_SEEDS[0]),
+        "checkpoint_path": candidate["checkpoint_path"],
+        "training_iteration": candidate["training_iteration"],
+        "observation_filter": observation_filter,
+        "center_total_sla_violations": candidate.get("center_total_sla_violations"),
+        "system_total_sla_violations": candidate.get("system_total_sla_violations"),
+        "system_throughput_mbps": candidate.get("system_throughput_mbps"),
+        "episode_return_mean": candidate.get("episode_return_mean"),
+        "quality_score": candidate.get("quality_score"),
+    }
+
+    runs = []
+    for seed in EVAL_SEEDS:
+        env = MultiCell_5G_SLA_Env(config=evaluator["env_config"])
+        runs.append(run_evaluation(env, algo_key, seed, learned_evaluator=evaluator))
+
+    aggregated_algo = aggregate_results({algo_key: runs})[algo_key]
+    summary = summarize_eval_stats(aggregated_algo)
+    return evaluator, runs, summary
 
 
 def stop_learned_evaluators():
@@ -313,84 +359,79 @@ def init_learned_evaluators():
         experiment_dirs = LEARNED_EXPERIMENT_DIRS[algo_key]
         env_config = LEARNED_ENV_CONFIGS[algo_key]
         method_label = method["label"]
-
-        for train_seed, experiment_dir in zip(TRAIN_SEEDS, experiment_dirs):
-            ranked_checkpoints = rank_checkpoints_by_metric(
-                experiment_dir,
-                min_training_iteration=MIN_EVAL_CHECKPOINT_ITER,
-                fallback_to_any=False,
+        ranked_checkpoints = rank_checkpoints_by_metric(
+            experiment_dirs,
+            min_training_iteration=MIN_EVAL_CHECKPOINT_ITER,
+            fallback_to_any=False,
+        )
+        if not ranked_checkpoints:
+            restore_errors.append(
+                f"{method_label}, experiment_dirs={experiment_dirs} -> "
+                f"no ranked checkpoint found with iter>={MIN_EVAL_CHECKPOINT_ITER}"
             )
-            if not ranked_checkpoints:
+            continue
+
+        best = None
+        print(f"\n--- Eval sweep {method_label} ({len(ranked_checkpoints)} candidates) ---")
+        for item in ranked_checkpoints:
+            checkpoint_path = item["checkpoint_path"]
+            score = item.get("episode_return_mean")
+            iteration = item.get("training_iteration")
+            total_sla_violation = item.get("center_total_sla_violations")
+            quality_score = item.get("quality_score")
+            system_throughput_mbps = item.get("system_throughput_mbps")
+            train_seed = item.get("train_seed")
+            print(
+                f"Trying {method_label} checkpoint: {checkpoint_path} "
+                f"(train_seed={train_seed}, iter={iteration}, "
+                f"log_center_total_viol={total_sla_violation}, log_system_tp={system_throughput_mbps}, "
+                f"quality={quality_score}, episode_return_mean={score})"
+            )
+            try:
+                evaluator, _, summary = evaluate_learned_checkpoint_candidate(method, item)
+            except Exception as exc:  # noqa: PERF203
                 restore_errors.append(
-                    f"{method_label} train_seed={train_seed}, experiment_dir={experiment_dir} -> "
-                    f"no ranked checkpoint found with iter>={MIN_EVAL_CHECKPOINT_ITER}"
+                    f"{method_label}, checkpoint={checkpoint_path}, train_seed={train_seed} -> {exc}"
                 )
                 continue
 
-            restored = False
-            for item in ranked_checkpoints:
-                checkpoint_path = item["checkpoint_path"]
-                score = item.get("episode_return_mean")
-                iteration = item.get("training_iteration")
-                urllc_violation = item.get("center_urllc_violations")
-                embb_violation = item.get("center_embb_violations")
-                mmtc_violation = item.get("center_mmtc_violations")
-                total_sla_violation = item.get("center_total_sla_violations")
-                urllc_delay_ms = item.get("center_urllc_delay_ms")
-                quality_score = item.get("quality_score")
-                base_tp = item.get("center_reward_base_tp")
-                system_throughput_mbps = item.get("system_throughput_mbps")
-                trial_dir = item.get("trial_dir")
-                observation_filter = _resolve_trial_observation_filter(trial_dir)
-                algo = build_learned_eval_algo(observation_filter=observation_filter, env_config=env_config)
+            print(
+                f"  eval_total_viol={summary['system_total_sla_violations']:.4f}, "
+                f"eval_bs0_total_viol={summary['bs0_total_sla_violations']:.4f}, "
+                f"eval_sys_tp={summary['system_tp_mean_mbps']:.2f} Mbps, "
+                f"eval_sla_sys[eMBB]={summary['sla_sys_mean'][0]*100:.2f}%, "
+                f"eval_sla_bs0[eMBB]={summary['sla_bs0_mean'][0]*100:.2f}%"
+            )
 
-                print(
-                    f"Trying {method_label} checkpoint: {checkpoint_path} "
-                    f"(train_seed={train_seed}, iter={iteration}, obs_filter={observation_filter}, "
-                    f"total_viol={total_sla_violation}, embb_viol={embb_violation}, "
-                    f"urllc_viol={urllc_violation}, mmtc_viol={mmtc_violation}, "
-                    f"urllc_delay_ms={urllc_delay_ms}, system_tp={system_throughput_mbps}, base_tp={base_tp}, "
-                    f"quality={quality_score}, episode_return_mean={score})"
-                )
-                try:
-                    algo.restore(checkpoint_path)
-                    evaluator = {
-                        "algo_key": algo_key,
-                        "label": method_label,
-                        "algo": algo,
-                        "env_config": dict(env_config),
-                        "train_seed": train_seed,
-                        "checkpoint_path": checkpoint_path,
-                        "training_iteration": iteration,
-                        "observation_filter": observation_filter,
-                        "center_urllc_violations": urllc_violation,
-                        "center_embb_violations": embb_violation,
-                        "center_mmtc_violations": mmtc_violation,
-                        "center_total_sla_violations": total_sla_violation,
-                        "center_urllc_delay_ms": urllc_delay_ms,
-                        "center_reward_base_tp": base_tp,
-                        "system_throughput_mbps": system_throughput_mbps,
-                        "episode_return_mean": score,
-                        "quality_score": quality_score,
-                    }
-                    evaluators_by_algo[algo_key].append(evaluator)
-                    print(
-                        f"Loaded {method_label} checkpoint: {checkpoint_path} "
-                        f"(train_seed={train_seed}, obs_filter={observation_filter}, "
-                        f"total_viol={total_sla_violation}, system_tp={system_throughput_mbps}, "
-                        f"quality={quality_score})"
-                    )
-                    restored = True
-                    break
-                except Exception as exc:  # noqa: PERF203
-                    algo.stop()
-                    restore_errors.append(
-                        f"{method_label} train_seed={train_seed}, checkpoint={checkpoint_path}, "
-                        f"obs_filter={observation_filter} -> {exc}"
-                    )
+            rank_key = candidate_eval_key(summary, iteration)
+            if best is None or rank_key < best["rank_key"]:
+                if best is not None:
+                    best["evaluator"]["algo"].stop()
+                best = {
+                    "evaluator": evaluator,
+                    "summary": summary,
+                    "rank_key": rank_key,
+                }
+            else:
+                evaluator["algo"].stop()
 
-            if not restored:
-                print(f"Warning: no restorable checkpoint found for {method_label} train_seed={train_seed}.")
+        if best is None:
+            print(f"Warning: no restorable checkpoint found for {method_label}.")
+            continue
+
+        best_evaluator = best["evaluator"]
+        best_summary = best["summary"]
+        evaluators_by_algo[algo_key].append(best_evaluator)
+        print(
+            f"Loaded {method_label} checkpoint via {LEARNED_SELECTION_MODE}: "
+            f"{best_evaluator['checkpoint_path']} "
+            f"(train_seed={best_evaluator['train_seed']}, iter={best_evaluator['training_iteration']}, "
+            f"obs_filter={best_evaluator['observation_filter']}, "
+            f"eval_total_viol={best_summary['system_total_sla_violations']:.4f}, "
+            f"eval_sys_tp={best_summary['system_tp_mean_mbps']:.2f} Mbps, "
+            f"eval_sla_sys[eMBB]={best_summary['sla_sys_mean'][0]*100:.2f}%, "
+            f"eval_sla_bs0[eMBB]={best_summary['sla_bs0_mean'][0]*100:.2f}%)"
+        )
 
     missing_methods = [m["label"] for m in LEARNED_METHODS if not evaluators_by_algo[m["algo_key"]]]
     if missing_methods:
@@ -460,13 +501,20 @@ def run_evaluation(env, algo_name, seed, learned_evaluator=None):
                 actions[agent] = ratios_to_action(static_ratios, env.action_softmax_temperature)
 
         elif algo_name == "priority":
-            urllc_priority_ratios = np.array([0.08333333, 0.8333333, 0.08333333], dtype=np.float32)
-            embb_priority_ratios = np.array([0.72, 0.20, 0.08], dtype=np.float32)
+            # Archive-style single-agent heuristic, ported to the current
+            # multi-cell benchmark using the same effective Softmax ratios.
+            # The legacy heuristic switched on obs[4] (URLLC queue feature),
+            # so we intentionally read the pure_local observation instead of
+            # the raw env queue directly to preserve the old decision rule.
+            normal_ratios = np.array([0.6621907, 0.29754147, 0.04026786], dtype=np.float32)
+            emergency_ratios = np.array([0.4435102, 0.4901546, 0.0663352], dtype=np.float32)
             for agent in env.agents:
-                if env.queues[agent][1] > 0.05:
-                    actions[agent] = ratios_to_action(urllc_priority_ratios, env.action_softmax_temperature)
+                agent_obs = obs[agent]
+                urllc_queue_feature = float(agent_obs[4])
+                if urllc_queue_feature > 0.005:
+                    actions[agent] = ratios_to_action(emergency_ratios, env.action_softmax_temperature)
                 else:
-                    actions[agent] = ratios_to_action(embb_priority_ratios, env.action_softmax_temperature)
+                    actions[agent] = ratios_to_action(normal_ratios, env.action_softmax_temperature)
 
         elif algo_name == "max_weight":
             # Throughput-oriented heuristic: queue backlog weighted by instant SE.
@@ -547,6 +595,8 @@ def run_evaluation(env, algo_name, seed, learned_evaluator=None):
 
         if env.reward_mode == "binary_sla_reward":
             throughput_reward_weight = 1.0 / max(env.binary_reward_throughput_scale, 1e-6)
+        elif env.reward_mode == "archive_local_sla":
+            throughput_reward_weight = 1.0 / 100.0
         elif env.reward_mode == "simple_local_sla":
             throughput_reward_weight = env.simple_reward_throughput_weight
         else:
@@ -725,7 +775,10 @@ def plot_with_band(ax, x_axis, mean, std, label, color):
 
 def run_baselines():
     validate_seed_split()
-    print(f"Initializing learned checkpoints by training seed (min_iter={MIN_EVAL_CHECKPOINT_ITER})...")
+    print(
+        f"Initializing learned checkpoints via {LEARNED_SELECTION_MODE} "
+        f"(min_iter={MIN_EVAL_CHECKPOINT_ITER})..."
+    )
     learned_evaluators_by_algo = init_learned_evaluators()
     for method in LEARNED_METHODS:
         algo_key = method["algo_key"]
@@ -803,6 +856,12 @@ def run_baselines():
             f"{stats['sla_sys_mean'][1]*100:.1f}%/"
             f"{stats['sla_sys_mean'][2]*100:.1f}%"
         )
+        sla_bs0_text = (
+            "SLA_bs0[eMBB/URLLC/mMTC]="
+            f"{stats['sla_bs0_mean'][0]*100:.1f}%/"
+            f"{stats['sla_bs0_mean'][1]*100:.1f}%/"
+            f"{stats['sla_bs0_mean'][2]*100:.1f}%"
+        )
         penalty_text = (
             "Penalty[total/eMBB/URLLC/mMTC]="
             f"{stats['penalty_total_scalar']:.3f}/"
@@ -825,6 +884,7 @@ def run_baselines():
             f"{fairness_text}, {sys_tp_text}, {delay_text}, {reward_text}"
         )
         print(f"{' ':>22}{sla_sys_text}")
+        print(f"{' ':>22}{sla_bs0_text}")
         print(f"{' ':>22}{reward_base_text}, {penalty_text}")
         print(f"{' ':>22}{penalty_share_text}")
         if algo_key in LEARNED_METHOD_BY_KEY:
@@ -840,10 +900,14 @@ def run_baselines():
             )
 
     x = np.arange(ROLLOUT_STEPS)
-    fig, axes = plt.subplots(3, 2, figsize=(18, 15))
+    comparison_algos = main_comparison_algorithms()
+    labels = [label for _, label in comparison_algos]
+    x_idx = np.arange(len(comparison_algos))
+    os.makedirs("./results", exist_ok=True)
 
-    ax1 = axes[0, 0]
-    for algo_key, algo_label in main_comparison_algorithms():
+    # Figure 1: URLLC delay timeline.
+    fig1, ax1 = plt.subplots(figsize=(10, 6))
+    for algo_key, algo_label in comparison_algos:
         stats = aggregated[algo_key]
         plot_with_band(
             ax1,
@@ -857,11 +921,49 @@ def run_baselines():
     ax1.set_title("URLLC Delay (mean ± std)")
     ax1.set_xlabel("Time Step (TTI)")
     ax1.set_ylabel("Delay (ms)")
+    delay_scale_keys = [k for k, _ in comparison_algos if k not in DELAY_PLOT_SCALE_EXCLUDE_ALGOS]
+    if not delay_scale_keys:
+        delay_scale_keys = [k for k, _ in comparison_algos]
+    delay_scale_values = np.concatenate(
+        [np.asarray(aggregated[k]["delay_mean"], dtype=np.float64).ravel() for k in delay_scale_keys]
+    )
+    delay_scale_q = float(np.nanpercentile(delay_scale_values, DELAY_PLOT_SCALE_PERCENTILE))
+    delay_ylim_upper = max(
+        DELAY_PLOT_MIN_UPPER_MS,
+        2.05,
+        delay_scale_q * DELAY_PLOT_SCALE_MARGIN,
+    )
+    ax1.set_ylim(0.0, delay_ylim_upper)
+    clipped_algos = [
+        algo_label
+        for algo_key, algo_label in comparison_algos
+        if float(np.nanmax(np.asarray(aggregated[algo_key]["delay_mean"], dtype=np.float64))) > delay_ylim_upper
+    ]
+    if clipped_algos:
+        clipped_text = ", ".join(clipped_algos)
+        ax1.text(
+            0.99,
+            0.02,
+            f"Clipped above {delay_ylim_upper:.2f} ms: {clipped_text}",
+            transform=ax1.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            color="dimgray",
+            bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+        )
     ax1.grid(True)
     ax1.legend()
+    fig1.tight_layout()
+    delay_path = f"./results/marl_baseline_delay_{ENV_PROFILE}_multiseed.png"
+    fig1.savefig(delay_path)
+    plt.close(fig1)
 
-    ax2 = axes[0, 1]
-    for algo_key, algo_label in main_comparison_algorithms():
+    # Figure 2: Cumulative reward timeline (exclude MAPPO line by request).
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+    for algo_key, algo_label in comparison_algos:
+        if algo_key == "mappo":
+            continue
         stats = aggregated[algo_key]
         plot_with_band(
             ax2,
@@ -871,108 +973,137 @@ def run_baselines():
             algo_label,
             PLOT_COLORS[algo_key],
         )
-    ax2.set_title("Cumulative Reward (mean ± std, BS_0)")
+    ax2.set_title("Cumulative Reward (mean ± std, BS_0, MAPPO Hidden)")
     ax2.set_xlabel("Time Step (TTI)")
     ax2.set_ylabel("Cumulative Reward")
     ax2.grid(True)
     ax2.legend()
+    fig2.tight_layout()
+    reward_path = f"./results/marl_baseline_cum_reward_{ENV_PROFILE}_multiseed.png"
+    fig2.savefig(reward_path)
+    plt.close(fig2)
 
-    ax3 = axes[1, 0]
-    for algo_key, algo_label in main_comparison_algorithms():
-        stats = aggregated[algo_key]
-        plot_with_band(
-            ax3,
-            x,
-            stats["shortfall_mean"],
-            stats["shortfall_std"],
-            algo_label,
-            PLOT_COLORS[algo_key],
-        )
-    ax3.set_title("eMBB Shortfall (mean ± std, BS_0)")
-    ax3.set_xlabel("Time Step (TTI)")
-    ax3.set_ylabel("Shortfall (Mbps)")
-    ax3.grid(True)
-    ax3.legend()
-
-    ax4 = axes[1, 1]
-    for algo_key, algo_label in ALGORITHMS:
-        stats = aggregated[algo_key]
-        plot_with_band(
-            ax4,
-            x,
-            stats["system_tp_mean"],
-            stats["system_tp_std"],
-            algo_label,
-            PLOT_COLORS[algo_key],
-        )
-    ax4.set_title("System Throughput (mean ± std, 7 cells)")
-    ax4.set_xlabel("Time Step (TTI)")
-    ax4.set_ylabel("Throughput (Mbps)")
-    ax4.grid(True)
-    ax4.legend()
-
-    ax5 = axes[2, 0]
-    comparison_algos = main_comparison_algorithms()
-    labels = [label for _, label in comparison_algos]
-    fairness_means = [aggregated[key]["fairness_mean"] for key, _ in comparison_algos]
-    fairness_stds = [aggregated[key]["fairness_std"] for key, _ in comparison_algos]
-    bars = ax5.bar(labels, fairness_means, yerr=fairness_stds, capsize=4.0, color=[PLOT_COLORS[k] for k, _ in comparison_algos])
-    ax5.set_title("Jain Fairness Index (eMBB Throughput)")
-    ax5.set_ylabel("JFI")
-    ax5.set_ylim(0.0, 1.05)
-    ax5.grid(True, axis="y")
-    ax5.tick_params(axis="x", rotation=20)
-
-    learned_inference_lines = []
-    for method in LEARNED_METHODS:
-        stats = aggregated[method["algo_key"]]
-        learned_inference_lines.append(
-            f"{method['algo_key'].upper()}: total={stats['inference_total_ms_mean']:.4f} ms, "
-            f"per-agent={stats['inference_per_agent_ms_mean']:.4f} ms, "
-            f"p95={stats['inference_p95_total_ms_mean']:.4f} ms"
-        )
-    ax5.text(
-        0.02,
-        0.92,
-        "Inference overhead:\n" + "\n".join(learned_inference_lines),
-        transform=ax5.transAxes,
-        verticalalignment="top",
-        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "gray"},
+    # Figure 3: Average system throughput bar chart.
+    fig3, ax3 = plt.subplots(figsize=(10, 6))
+    sys_tp_means = np.array([np.mean(aggregated[key]["system_tp_mean"]) for key, _ in comparison_algos], dtype=np.float64)
+    sys_tp_stds = np.array([np.std(aggregated[key]["system_tp_mean"]) for key, _ in comparison_algos], dtype=np.float64)
+    ax3.bar(
+        x_idx,
+        sys_tp_means,
+        yerr=sys_tp_stds,
+        capsize=4.0,
+        color=[PLOT_COLORS[key] for key, _ in comparison_algos],
     )
+    ax3.set_xticks(x_idx, labels, rotation=20)
+    ax3.set_title("Average System Throughput (7 cells)")
+    ax3.set_ylabel("Mbps")
+    ax3.grid(True, axis="y")
+    fig3.tight_layout()
+    throughput_path = f"./results/marl_baseline_system_throughput_{ENV_PROFILE}_multiseed.png"
+    fig3.savefig(throughput_path)
+    plt.close(fig3)
 
-    for bar, score in zip(bars, fairness_means):
-        ax5.text(
-            bar.get_x() + bar.get_width() / 2.0,
-            bar.get_height() + 0.02,
-            f"{score:.3f}",
-            ha="center",
-            va="bottom",
-            fontsize=9,
+    # Figure 4: Fairness + shortfall table.
+    fig4, ax4 = plt.subplots(figsize=(12, 5))
+    ax4.axis("off")
+    table_rows = []
+    for algo_key, algo_label in comparison_algos:
+        stats = aggregated[algo_key]
+        table_rows.append(
+            [
+                algo_label,
+                f"{stats['fairness_mean']:.4f}",
+                f"{np.mean(stats['shortfall_mean']):.2f}",
+            ]
+        )
+    table = ax4.table(
+        cellText=table_rows,
+        colLabels=["Algorithm", "Jain Fairness (eMBB)", "Mean eMBB Shortfall (Mbps)"],
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.8)
+    ax4.set_title("Fairness + eMBB Shortfall Summary", pad=12)
+    fig4.tight_layout()
+    table_path = f"./results/marl_baseline_fairness_shortfall_{ENV_PROFILE}_multiseed.png"
+    fig4.savefig(table_path)
+    plt.close(fig4)
+
+    # Figure 5: SLA success grouped bars for all algorithms (system-level).
+    fig5, ax5_sys = plt.subplots(1, 1, figsize=(12, 6))
+    bar_width = 0.22
+    offsets = np.array([-bar_width, 0.0, bar_width], dtype=np.float64)
+    slice_names = ["eMBB", "URLLC", "mMTC"]
+    slice_colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+
+    for idx_slice, slice_name in enumerate(slice_names):
+        vals_sys = np.array([aggregated[k]["sla_sys_mean"][idx_slice] for k, _ in comparison_algos], dtype=np.float64)
+        std_sys = np.array([aggregated[k]["sla_sys_std"][idx_slice] for k, _ in comparison_algos], dtype=np.float64)
+        x_pos = x_idx + offsets[idx_slice]
+        ax5_sys.bar(
+            x_pos,
+            vals_sys,
+            yerr=std_sys,
+            capsize=3.0,
+            width=bar_width,
+            color=slice_colors[idx_slice],
+            alpha=0.85,
+            label=slice_name,
         )
 
-    ax6 = axes[2, 1]
-    x_idx = np.arange(len(comparison_algos))
-    width = 0.25
-    embb_sla = np.array([aggregated[key]["sla_sys_mean"][0] for key, _ in comparison_algos], dtype=np.float64)
-    urllc_sla = np.array([aggregated[key]["sla_sys_mean"][1] for key, _ in comparison_algos], dtype=np.float64)
-    mmtc_sla = np.array([aggregated[key]["sla_sys_mean"][2] for key, _ in comparison_algos], dtype=np.float64)
+    ax5_sys.set_ylim(0.0, 1.05)
+    ax5_sys.set_ylabel("Success Rate")
+    ax5_sys.set_title("SLA Success Rate by Algorithm (System-Level)")
+    ax5_sys.grid(True, axis="y")
+    ax5_sys.set_xticks(x_idx, labels, rotation=20)
+    ax5_sys.legend(loc="lower right")
+    fig5.tight_layout()
+    sla_system_path = f"./results/marl_baseline_sla_success_system_{ENV_PROFILE}_multiseed.png"
+    fig5.savefig(sla_system_path)
+    plt.close(fig5)
 
-    ax6.bar(x_idx - width, embb_sla, width=width, label="eMBB SLA success", color="#1f77b4")
-    ax6.bar(x_idx, urllc_sla, width=width, label="URLLC SLA success", color="#ff7f0e")
-    ax6.bar(x_idx + width, mmtc_sla, width=width, label="mMTC SLA success", color="#2ca02c")
-    ax6.set_xticks(x_idx, labels)
+    # Figure 6: BS_0 SLA success, IPPO vs MAPPO only.
+    bs0_pair_algos = [(k, v) for k, v in comparison_algos if k in ("ippo", "mappo")]
+    if len(bs0_pair_algos) != 2:
+        raise RuntimeError("Expected both IPPO and MAPPO in comparison algorithms for BS_0 SLA figure.")
+    bs0_labels = [label for _, label in bs0_pair_algos]
+    bs0_x = np.arange(len(bs0_pair_algos))
+
+    fig6, ax6 = plt.subplots(1, 1, figsize=(9, 6))
+    for idx_slice, slice_name in enumerate(slice_names):
+        vals_bs0 = np.array([aggregated[k]["sla_bs0_mean"][idx_slice] for k, _ in bs0_pair_algos], dtype=np.float64)
+        std_bs0 = np.array([aggregated[k]["sla_bs0_std"][idx_slice] for k, _ in bs0_pair_algos], dtype=np.float64)
+        x_pos = bs0_x + offsets[idx_slice]
+        ax6.bar(
+            x_pos,
+            vals_bs0,
+            yerr=std_bs0,
+            capsize=3.0,
+            width=bar_width,
+            color=slice_colors[idx_slice],
+            alpha=0.88,
+            label=slice_name,
+        )
     ax6.set_ylim(0.0, 1.05)
     ax6.set_ylabel("Success Rate")
-    ax6.set_title("System SLA Success Rate (mean over seeds)")
-    ax6.tick_params(axis="x", rotation=20)
+    ax6.set_title("BS_0 SLA Success: IPPO vs MAPPO")
+    ax6.set_xticks(bs0_x, bs0_labels, rotation=10)
     ax6.grid(True, axis="y")
-    ax6.legend()
+    ax6.legend(loc="lower right")
+    fig6.tight_layout()
+    bs0_sla_pair_path = f"./results/marl_baseline_bs0_ippo_mappo_sla_{ENV_PROFILE}_multiseed.png"
+    fig6.savefig(bs0_sla_pair_path)
+    plt.close(fig6)
 
-    os.makedirs("./results", exist_ok=True)
-    plt.tight_layout()
-    output_path = f"./results/marl_baseline_comparison_{ENV_PROFILE}_multiseed.png"
-    plt.savefig(output_path)
-    print(f"Saved comparison plots to {output_path}")
+    print("Saved comparison plots:")
+    print(f"  - {delay_path}")
+    print(f"  - {reward_path}")
+    print(f"  - {throughput_path}")
+    print(f"  - {table_path}")
+    print(f"  - {sla_system_path}")
+    print(f"  - {bs0_sla_pair_path}")
 
     stop_learned_evaluators()
     if ray.is_initialized():

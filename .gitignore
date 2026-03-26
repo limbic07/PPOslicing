@@ -15,6 +15,7 @@ venv.bak/
 
 # Ray & Reinforcement Learning Results
 ray_results/
+archived_ray_results/
 results/
 logs_formal/
 models_formal/

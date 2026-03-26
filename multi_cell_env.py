@@ -5,7 +5,7 @@ from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from gymnasium import spaces
 from gymnasium.utils.seeding import np_random
 
-from ippo_rl_module import CENTRALIZED_CRITIC_GLOBAL_DIM, DEFAULT_INITIAL_SLICE_RATIOS
+from ippo_rl_module import CENTRALIZED_CRITIC_GLOBAL_DIM, resolve_local_obs_dim
 
 class MultiCell_5G_SLA_Env(MultiAgentEnv):
     """
@@ -67,15 +67,16 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
             raise ValueError("embb_sla_window_tti must be >= 1")
         self.reward_mode = str(cfg_value("reward_mode", "tail_risk_coop")).lower()
         self.cooperative_alpha = float(cfg_value("cooperative_alpha", 0.7))
-        self.action_softmax_temperature = float(cfg_value("action_softmax_temperature", 3.0))
+        self.neighbor_liability_beta = float(cfg_value("neighbor_liability_beta", 0.5))
+        self.action_softmax_temperature = float(cfg_value("action_softmax_temperature", 1.0))
         self.observation_mode = str(cfg_value("observation_mode", "pure_local")).lower()
+        self.include_ici_features = bool(cfg_value("neighbor_augmented_include_ici_features", False))
+        self.cooperative_target = str(cfg_value("cooperative_target", "all")).lower()
+        self.neighbor_urgency_pooling = str(cfg_value("neighbor_urgency_pooling", "max")).lower()
         self.use_centralized_critic = bool(cfg_value("use_centralized_critic", False))
         self.centralized_critic_global_dim = int(
             cfg_value("centralized_critic_global_dim", CENTRALIZED_CRITIC_GLOBAL_DIM)
         )
-        self.neighbor_coop_gain = float(cfg_value("neighbor_coop_gain", 4.0))
-        if self.neighbor_coop_gain < 0.0:
-            raise ValueError("neighbor_coop_gain must be >= 0")
         self.expected_centralized_critic_global_dim = self.num_cells * 12
         if (
             self.use_centralized_critic
@@ -90,31 +91,43 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
             raise ValueError("centralized_critic_global_dim must be >= 0")
         if self.action_softmax_temperature <= 0.0:
             raise ValueError("action_softmax_temperature must be > 0")
+        if self.neighbor_liability_beta < 0.0:
+            raise ValueError("neighbor_liability_beta must be >= 0")
         if self.observation_mode not in {"pure_local", "neighbor_augmented"}:
             raise ValueError(
                 f"Unsupported observation_mode={self.observation_mode!r}. "
                 "Expected one of ['neighbor_augmented', 'pure_local']"
             )
+        if self.neighbor_urgency_pooling not in {"mean", "max"}:
+            raise ValueError(
+                f"Unsupported neighbor_urgency_pooling={self.neighbor_urgency_pooling!r}. "
+                "Expected one of ['mean', 'max']"
+            )
+        if self.cooperative_target not in {"all", "embb_only"}:
+            raise ValueError(
+                f"Unsupported cooperative_target={self.cooperative_target!r}. "
+                "Expected one of ['all', 'embb_only']"
+            )
 
         # --- Reward shaping params (tunable) ---
         # Continuous URLLC soft-cliff: warning before 2ms and sharp increase after deadline.
-        self.penalty_weight = float(self.config.get("penalty_weight", 0.5))
-        self.w_embb = float(self.config.get("w_embb", self.penalty_weight))
-        self.w_urllc = float(self.config.get("w_urllc", self.penalty_weight))
-        self.w_mmtc = float(self.config.get("w_mmtc", self.penalty_weight))
-        self.urllc_warning_ratio = float(self.config.get("urllc_warning_ratio", 0.9))
-        self.urllc_tail_ratio = float(self.config.get("urllc_tail_ratio", 0.92))
-        self.urllc_softplus_slope = float(self.config.get("urllc_softplus_slope", 12.0))
-        self.urllc_warning_gain = float(self.config.get("urllc_warning_gain", 0.2))
-        self.urllc_tail_quad_gain = float(self.config.get("urllc_tail_quad_gain", 2.0))
-        self.urllc_hard_violation_gain = float(self.config.get("urllc_hard_violation_gain", 1.75))
-        self.urllc_overflow_gain = float(self.config.get("urllc_overflow_gain", 3.0))
-        self.urllc_exp_coeff = float(self.config.get("urllc_exp_coeff", 1.6))
-        self.urllc_penalty_cap_factor = float(self.config.get("urllc_penalty_cap_factor", 10.0))
-        self.embb_penalty_quad_gain = float(self.config.get("embb_penalty_quad_gain", 1.2))
-        self.embb_penalty_cubic_gain = float(self.config.get("embb_penalty_cubic_gain", 0.0))
-        self.embb_penalty_cap_factor = float(self.config.get("embb_penalty_cap_factor", 10.0))
-        self.mmtc_penalty_cap_factor = float(self.config.get("mmtc_penalty_cap_factor", 5.0))
+        self.penalty_weight = float(cfg_value("penalty_weight", 0.5))
+        self.w_embb = float(cfg_value("w_embb", self.penalty_weight))
+        self.w_urllc = float(cfg_value("w_urllc", self.penalty_weight))
+        self.w_mmtc = float(cfg_value("w_mmtc", self.penalty_weight))
+        self.urllc_warning_ratio = float(cfg_value("urllc_warning_ratio", 0.9))
+        self.urllc_tail_ratio = float(cfg_value("urllc_tail_ratio", 0.92))
+        self.urllc_softplus_slope = float(cfg_value("urllc_softplus_slope", 12.0))
+        self.urllc_warning_gain = float(cfg_value("urllc_warning_gain", 0.2))
+        self.urllc_tail_quad_gain = float(cfg_value("urllc_tail_quad_gain", 2.0))
+        self.urllc_hard_violation_gain = float(cfg_value("urllc_hard_violation_gain", 1.75))
+        self.urllc_overflow_gain = float(cfg_value("urllc_overflow_gain", 3.0))
+        self.urllc_exp_coeff = float(cfg_value("urllc_exp_coeff", 1.6))
+        self.urllc_penalty_cap_factor = float(cfg_value("urllc_penalty_cap_factor", 10.0))
+        self.embb_penalty_quad_gain = float(cfg_value("embb_penalty_quad_gain", 1.2))
+        self.embb_penalty_cubic_gain = float(cfg_value("embb_penalty_cubic_gain", 0.0))
+        self.embb_penalty_cap_factor = float(cfg_value("embb_penalty_cap_factor", 10.0))
+        self.mmtc_penalty_cap_factor = float(cfg_value("mmtc_penalty_cap_factor", 5.0))
         self.embb_violation_cap = float(cfg_value("embb_violation_cap", 2.0))
         self.urllc_violation_cap = float(cfg_value("urllc_violation_cap", 5.0))
         self.mmtc_violation_cap = float(cfg_value("mmtc_violation_cap", 2.0))
@@ -127,14 +140,31 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
         self.urllc_burst_end_prob = float(cfg_value("urllc_burst_end_prob", 0.2))
         self.urllc_burst_mean_mbps = float(cfg_value("urllc_burst_mean_mbps", 160.0))
         self.urllc_burst_std_mbps = float(cfg_value("urllc_burst_std_mbps", 20.0))
+        self.urllc_regional_event_start_prob = float(cfg_value("urllc_regional_event_start_prob", 0.0))
+        self.urllc_regional_event_end_prob = float(cfg_value("urllc_regional_event_end_prob", 0.0))
+        self.urllc_regional_event_start_boost = float(cfg_value("urllc_regional_event_start_boost", 0.0))
+        self.urllc_regional_event_burst_mean_boost_mbps = float(
+            cfg_value("urllc_regional_event_burst_mean_boost_mbps", 0.0)
+        )
+        self.embb_mean_mbps = float(cfg_value("embb_mean_mbps", 250.0))
+        self.embb_std_mbps = float(cfg_value("embb_std_mbps", 40.0))
+        self.embb_clip_low_mbps = float(cfg_value("embb_clip_low_mbps", 180.0))
+        self.embb_clip_high_mbps = float(cfg_value("embb_clip_high_mbps", 350.0))
+        self.embb_hotspot_rho = float(cfg_value("embb_hotspot_rho", 0.0))
+        self.embb_hotspot_std_mbps = float(cfg_value("embb_hotspot_std_mbps", 0.0))
+        self.embb_hotspot_clip_mbps = float(cfg_value("embb_hotspot_clip_mbps", 0.0))
+        self.embb_center_bias_mbps = float(cfg_value("embb_center_bias_mbps", 0.0))
+        self.embb_edge_bias_mbps = float(cfg_value("embb_edge_bias_mbps", 0.0))
+        self.urllc_center_burst_start_bias = float(cfg_value("urllc_center_burst_start_bias", 0.0))
+        self.urllc_edge_burst_start_bias = float(cfg_value("urllc_edge_burst_start_bias", 0.0))
         self.interference_neighbor_normalization = str(
             cfg_value("interference_neighbor_normalization", "fixed_max")
         ).lower()
         self.tail_reward_throughput_weight = float(cfg_value("tail_reward_throughput_weight", 1.0 / 300.0))
-        self.binary_reward_throughput_scale = float(cfg_value("binary_reward_throughput_scale", 80.0))
-        self.binary_penalty_embb = float(cfg_value("binary_penalty_embb", 4.0))
-        self.binary_penalty_urllc = float(cfg_value("binary_penalty_urllc", 6.0))
-        self.binary_penalty_mmtc = float(cfg_value("binary_penalty_mmtc", 4.0))
+        self.binary_reward_throughput_scale = float(cfg_value("binary_reward_throughput_scale", 60.0))
+        self.binary_penalty_embb = float(cfg_value("binary_penalty_embb", 3.0))
+        self.binary_penalty_urllc = float(cfg_value("binary_penalty_urllc", 4.0))
+        self.binary_penalty_mmtc = float(cfg_value("binary_penalty_mmtc", 3.0))
         self.binary_urllc_yellow_start_ratio = float(cfg_value("binary_urllc_yellow_start_ratio", 0.5))
         self.binary_urllc_yellow_penalty = float(
             cfg_value("binary_urllc_yellow_penalty", self.binary_penalty_urllc)
@@ -149,17 +179,41 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
         self.simple_reward_penalty_urllc_linear = float(cfg_value("simple_reward_penalty_urllc_linear", 1.0))
         self.simple_reward_penalty_urllc_quad = float(cfg_value("simple_reward_penalty_urllc_quad", 0.5))
         self.simple_reward_penalty_mmtc_linear = float(cfg_value("simple_reward_penalty_mmtc_linear", 0.5))
+        self.neighbor_penalty_degree_ref = float(cfg_value("neighbor_penalty_degree_ref", 3.0))
+        self.neighbor_dividend_gamma = float(cfg_value("neighbor_dividend_gamma", 1.0))
+        self.neighbor_dividend_penalty_weight = float(cfg_value("neighbor_dividend_penalty_weight", 1.0))
+        self.neighbor_dividend_throughput_weight = float(cfg_value("neighbor_dividend_throughput_weight", 0.25))
+        self.neighbor_dividend_max = float(cfg_value("neighbor_dividend_max", 1.5))
+        self.neighbor_dividend_gate_urllc_delay_ratio = float(
+            cfg_value("neighbor_dividend_gate_urllc_delay_ratio", 0.85)
+        )
+        self.neighbor_dividend_gate_embb_shortfall_ratio = float(
+            cfg_value("neighbor_dividend_gate_embb_shortfall_ratio", 0.10)
+        )
         self.center_reward_scale = float(cfg_value("center_reward_scale", 1.0))
         self.reward_clip_abs = float(cfg_value("reward_clip_abs", 10.0))
+        if self.neighbor_penalty_degree_ref <= 0.0:
+            raise ValueError("neighbor_penalty_degree_ref must be > 0")
+        if self.neighbor_dividend_gamma < 0.0:
+            raise ValueError("neighbor_dividend_gamma must be >= 0")
+        if self.neighbor_dividend_max < 0.0:
+            raise ValueError("neighbor_dividend_max must be >= 0")
+        if self.neighbor_dividend_gate_urllc_delay_ratio < 0.0:
+            raise ValueError("neighbor_dividend_gate_urllc_delay_ratio must be >= 0")
+        if self.neighbor_dividend_gate_embb_shortfall_ratio < 0.0:
+            raise ValueError("neighbor_dividend_gate_embb_shortfall_ratio must be >= 0")
 
         # --- Spaces ---
         # Per-agent spaces required by RLlib env_runner + connector v2 stack.
         # Obs dims depend on observation_mode:
-        # pure_local=14, neighbor_augmented=20.
+        # pure_local=9, neighbor_augmented=15 or 19 (with ICI features).
         self._agent_action_space = spaces.Box(
             low=np.float32(-1.0), high=np.float32(1.0), shape=(3,), dtype=np.float32
         )
-        self.local_obs_dim = 14 if self.observation_mode == "pure_local" else 20
+        self.local_obs_dim = resolve_local_obs_dim(
+            self.observation_mode,
+            include_ici_features=self.include_ici_features,
+        )
         critic_context_dim = self.centralized_critic_global_dim if self.use_centralized_critic else 0
         self.obs_dim = self.local_obs_dim + critic_context_dim
         self._agent_observation_space = spaces.Box(
@@ -175,6 +229,7 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
         self.state = {agent: np.zeros(14, dtype=np.float32) for agent in self.agents}
         self.queues = {agent: np.zeros(3, dtype=np.float32) for agent in self.agents}
         self.current_se = {agent: np.zeros(3, dtype=np.float32) for agent in self.agents}
+        self.embb_hotspot_bias_mbps = {agent: np.float32(0.0) for agent in self.agents}
         self.embb_tp_history = {
             agent: deque(maxlen=self.embb_sla_window_tti) for agent in self.agents
         }
@@ -182,6 +237,10 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
         self.max_steps = 200
         self.current_step = 0
         self.burst_state = {agent: False for agent in self.agents}
+        self.regional_urllc_event_active = False
+        self.regional_urllc_event_anchor = None
+        self.prev_neighbor_penalty_signal = {agent: 0.0 for agent in self.agents}
+        self.prev_neighbor_throughput_signal = {agent: 0.0 for agent in self.agents}
         self.np_random, _ = np_random(None)
 
     @staticmethod
@@ -191,8 +250,16 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 "embb_sla_window_tti": 1,
                 "reward_mode": "tail_risk_coop",
                 "cooperative_alpha": 0.7,
-                "neighbor_coop_gain": 2.0,
-                "action_softmax_temperature": 3.0,
+                "neighbor_liability_beta": 0.35,
+                "neighbor_penalty_degree_ref": 3.0,
+                "neighbor_dividend_gamma": 0.0,
+                "neighbor_dividend_penalty_weight": 1.0,
+                "neighbor_dividend_throughput_weight": 0.25,
+                "neighbor_dividend_max": 1.5,
+                "neighbor_dividend_gate_urllc_delay_ratio": 0.85,
+                "neighbor_dividend_gate_embb_shortfall_ratio": 0.10,
+                "neighbor_urgency_pooling": "max",
+                "action_softmax_temperature": 1.0,
                 "urllc_burst_start_prob": 0.05,
                 "urllc_burst_end_prob": 0.2,
                 "urllc_burst_mean_mbps": 160.0,
@@ -206,25 +273,48 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 "mmtc_violation_cap": 2.0,
             },
             "balanced": {
-                "embb_gbr": 220.0,
-                "embb_sla_window_tti": 8,
-                "reward_mode": "binary_sla_reward",
-                "cooperative_alpha": 0.7,
-                "neighbor_coop_gain": 4.0,
-                "action_softmax_temperature": 3.0,
+                "embb_gbr": 200.0,
+                "embb_sla_window_tti": 20,
+                "reward_mode": "archive_local_sla",
+                "cooperative_alpha": 0.5,
+                "neighbor_liability_beta": 0.35,
+                "neighbor_penalty_degree_ref": 3.0,
+                "neighbor_dividend_gamma": 1.0,
+                "neighbor_dividend_penalty_weight": 1.0,
+                "neighbor_dividend_throughput_weight": 0.25,
+                "neighbor_dividend_max": 1.5,
+                "neighbor_dividend_gate_urllc_delay_ratio": 0.85,
+                "neighbor_dividend_gate_embb_shortfall_ratio": 0.10,
+                "neighbor_urgency_pooling": "max",
+                "action_softmax_temperature": 1.0,
                 "urllc_burst_start_prob": 0.06,
-                "urllc_burst_end_prob": 0.35,
+                "urllc_burst_end_prob": 0.25,
                 "urllc_burst_mean_mbps": 100.0,
                 "urllc_burst_std_mbps": 15.0,
-                "ici_gain": 0.50,
-                "se_modifier_floor": 0.45,
+                "urllc_regional_event_start_prob": 0.04,
+                "urllc_regional_event_end_prob": 0.25,
+                "urllc_regional_event_start_boost": 0.18,
+                "urllc_regional_event_burst_mean_boost_mbps": 20.0,
+                "embb_mean_mbps": 250.0,
+                "embb_std_mbps": 40.0,
+                "embb_clip_low_mbps": 180.0,
+                "embb_clip_high_mbps": 350.0,
+                "embb_hotspot_rho": 0.92,
+                "embb_hotspot_std_mbps": 24.0,
+                "embb_hotspot_clip_mbps": 55.0,
+                "embb_center_bias_mbps": 15.0,
+                "embb_edge_bias_mbps": 0.0,
+                "urllc_center_burst_start_bias": 0.0,
+                "urllc_edge_burst_start_bias": 0.01,
+                "ici_gain": 0.42,
+                "se_modifier_floor": 0.50,
                 "interference_neighbor_normalization": "actual_neighbors",
-                "binary_reward_throughput_scale": 80.0,
-                "binary_penalty_embb": 4.0,
-                "binary_penalty_urllc": 6.0,
-                "binary_penalty_mmtc": 4.0,
-                "binary_urllc_yellow_start_ratio": 0.5,
-                "binary_urllc_yellow_penalty": 6.0,
+                "binary_reward_throughput_scale": 45.0,
+                "binary_penalty_embb": 2.0,
+                "binary_penalty_urllc": 3.0,
+                "binary_penalty_mmtc": 2.0,
+                "binary_urllc_yellow_start_ratio": 0.65,
+                "binary_urllc_yellow_penalty": 2.5,
                 "center_reward_scale": 1.0,
                 "reward_clip_abs": 0.0,
                 "embb_violation_cap": 2.0,
@@ -266,43 +356,108 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
 
         self.current_step = 0
         self.burst_state = {agent: False for agent in self.agents}
+        self.regional_urllc_event_active = False
+        self.regional_urllc_event_anchor = None
+        self.prev_neighbor_penalty_signal = {agent: 0.0 for agent in self.agents}
+        self.prev_neighbor_throughput_signal = {agent: 0.0 for agent in self.agents}
 
         obs = {}
+        self._update_regional_urllc_event()
         for agent in self.agents:
+            self.state[agent].fill(0.0)
             self.queues[agent] = np.zeros(3, dtype=np.float32)
             self.embb_tp_history[agent].clear()
             self.burst_state[agent] = False
+            self.embb_hotspot_bias_mbps[agent] = np.float32(0.0)
             self.current_se[agent] = (
                 self.mean_se + self.np_random.normal(0.0, 0.2, size=3)
             ).astype(np.float32)
             self._update_agent_state(agent)
-            
-            # Initial previous-ratio prior for the first step.
-            self.state[agent][9:12] = DEFAULT_INITIAL_SLICE_RATIOS
-            
             obs[agent] = self._build_obs(agent)
 
         return obs, {}
 
+    def _is_center_agent(self, agent):
+        return agent == "BS_0"
+
+    def _get_embb_role_bias_mbps(self, agent):
+        return self.embb_center_bias_mbps if self._is_center_agent(agent) else self.embb_edge_bias_mbps
+
+    def _get_urllc_burst_start_bias(self, agent):
+        return self.urllc_center_burst_start_bias if self._is_center_agent(agent) else self.urllc_edge_burst_start_bias
+
+    def _regional_urllc_affected_agents(self):
+        if not self.regional_urllc_event_active or self.regional_urllc_event_anchor is None:
+            return set()
+        anchor = self.regional_urllc_event_anchor
+        return {anchor, *self.neighbor_map.get(anchor, [])}
+
+    def _update_regional_urllc_event(self):
+        if self.urllc_regional_event_start_prob <= 0.0:
+            self.regional_urllc_event_active = False
+            self.regional_urllc_event_anchor = None
+            return
+
+        if self.regional_urllc_event_active:
+            if self.np_random.random() < self.urllc_regional_event_end_prob:
+                self.regional_urllc_event_active = False
+                self.regional_urllc_event_anchor = None
+        else:
+            if self.np_random.random() < self.urllc_regional_event_start_prob:
+                self.regional_urllc_event_active = True
+                self.regional_urllc_event_anchor = str(self.np_random.choice(self.agents))
+
     def _update_agent_state(self, agent):
-        
-        # eMBB: Heavy background traffic, wants 350 Mbps
+        # 1. eMBB: Heavy background traffic with temporally correlated hotspot bias.
+        if self.embb_hotspot_rho > 0.0 and self.embb_hotspot_std_mbps > 0.0 and self.embb_hotspot_clip_mbps > 0.0:
+            hotspot_noise = float(self.np_random.normal(0.0, self.embb_hotspot_std_mbps))
+            hotspot_bias = (
+                self.embb_hotspot_rho * float(self.embb_hotspot_bias_mbps[agent])
+                + np.sqrt(max(1.0 - (self.embb_hotspot_rho ** 2), 0.0)) * hotspot_noise
+            )
+            hotspot_bias = float(
+                np.clip(hotspot_bias, -self.embb_hotspot_clip_mbps, self.embb_hotspot_clip_mbps)
+            )
+            self.embb_hotspot_bias_mbps[agent] = np.float32(hotspot_bias)
+        else:
+            self.embb_hotspot_bias_mbps[agent] = np.float32(0.0)
+
+        embb_target_mean_mbps = (
+            self.embb_mean_mbps
+            + float(self.embb_hotspot_bias_mbps[agent])
+            + self._get_embb_role_bias_mbps(agent)
+        )
         arr_embb = np.float32(
-            np.clip(self.np_random.normal(250.0, 40.0), 180.0, 350.0)
+            np.clip(
+                self.np_random.normal(embb_target_mean_mbps, self.embb_std_mbps),
+                self.embb_clip_low_mbps,
+                self.embb_clip_high_mbps,
+            )
         )
 
-        # URLLC: Markov Burst State (Sustained bursts to kill static allocation)
+        # 2. URLLC: Markov Burst State (Sustained bursts to kill static allocation)
+        regional_agents = self._regional_urllc_affected_agents()
+        regional_event_affects_agent = agent in regional_agents
+        burst_start_prob = self.urllc_burst_start_prob + self._get_urllc_burst_start_bias(agent)
+        if regional_event_affects_agent:
+            burst_start_prob += self.urllc_regional_event_start_boost
+        burst_start_prob = float(np.clip(burst_start_prob, 0.0, 1.0))
+
         if self.burst_state[agent]:
             if self.np_random.random() < self.urllc_burst_end_prob:
                 self.burst_state[agent] = False
         else:
-            if self.np_random.random() < self.urllc_burst_start_prob:
+            if self.np_random.random() < burst_start_prob:
                 self.burst_state[agent] = True
-                
+
+        burst_mean_mbps = self.urllc_burst_mean_mbps
+        if regional_event_affects_agent:
+            burst_mean_mbps += self.urllc_regional_event_burst_mean_boost_mbps
+
         if self.burst_state[agent]:
             arr_urllc = np.float32(
                 np.clip(
-                    self.np_random.normal(self.urllc_burst_mean_mbps, self.urllc_burst_std_mbps),
+                    self.np_random.normal(burst_mean_mbps, self.urllc_burst_std_mbps),
                     0.0,
                     None,
                 )
@@ -374,6 +529,40 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
 
         return se_modifiers
 
+    def _estimate_neighbor_normalized_load(self, agent):
+        neighbor_ids = self.neighbor_map.get(agent, [])
+        if not neighbor_ids:
+            return np.zeros(3, dtype=np.float32)
+
+        prev_actions = np.array([self.state[neighbor][9:12] for neighbor in neighbor_ids], dtype=np.float32)
+        if self.interference_neighbor_normalization == "actual_neighbors":
+            normalizer = float(len(neighbor_ids))
+        elif self.interference_neighbor_normalization == "fixed_max":
+            normalizer = self.max_neighbors
+        else:
+            raise ValueError(
+                "Unsupported interference_neighbor_normalization="
+                f"{self.interference_neighbor_normalization!r}"
+            )
+        return (np.sum(prev_actions, axis=0) / max(normalizer, 1.0)).astype(np.float32)
+
+    def _get_neighbor_ici_features(self, agent):
+        normalized_neighbor_load = self._estimate_neighbor_normalized_load(agent)
+        se_modifiers = np.clip(
+            1.0 - (self.ici_gain * normalized_neighbor_load),
+            self.se_modifier_floor,
+            1.0,
+        ).astype(np.float32)
+        return np.array(
+            [
+                normalized_neighbor_load[0],
+                normalized_neighbor_load[1],
+                se_modifiers[0],
+                se_modifiers[1],
+            ],
+            dtype=np.float32,
+        )
+
     def _compute_tail_risk_reward(self, throughput_mbps, violations, est_delay):
         embb_violation = float(violations[0])
         raw_pen_embb = self.w_embb * (
@@ -432,6 +621,35 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
             "penalty_mmtc": pen_mmtc,
             "penalty_urllc_yellow": pen_urllc_yellow,
             "penalty_urllc_red": pen_urllc_red,
+        }
+
+    def _compute_archive_local_reward(self, achieved_throughput_mbps, est_delay, mmtc_overflow_flag):
+        throughput_slices = np.asarray(achieved_throughput_mbps, dtype=np.float32)
+        throughput_total = float(np.sum(throughput_slices))
+
+        embb_flag = float(throughput_slices[0] < self.sla_props["embb_gbr"])
+        urllc_flag = float(est_delay > self.sla_props["urllc_max_delay"])
+        mmtc_flag = float(bool(mmtc_overflow_flag))
+
+        throughput_bonus = float(throughput_total / 100.0)
+        pen_embb = 10.0 * embb_flag
+        pen_urllc = 20.0 * urllc_flag
+        pen_mmtc = 10.0 * mmtc_flag
+        penalty_total = float(pen_embb + pen_urllc + pen_mmtc)
+        reward_local = float(throughput_bonus - penalty_total)
+
+        return {
+            "local_reward": reward_local,
+            "reward_base_tp": throughput_bonus,
+            "reward_sla_bonus": 0.0,
+            "penalty_total": penalty_total,
+            "penalty_raw_embb": float(pen_embb),
+            "penalty_raw_urllc": float(pen_urllc),
+            "penalty_raw_mmtc": float(pen_mmtc),
+            "penalty_embb": float(pen_embb),
+            "penalty_urllc": float(pen_urllc),
+            "penalty_mmtc": float(pen_mmtc),
+            "local_archive_violation_flags": np.array([embb_flag, urllc_flag, mmtc_flag], dtype=np.float32),
         }
 
     def _compute_simple_local_reward(self, throughput_mbps, embb_eval_tp_mbps, violations):
@@ -522,6 +740,7 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
 
         # --- Physics Layer & Inter-Cell Interference (ICI) Calculation ---
         se_modifiers = self._calculate_interference_and_sinr(ratios_dict)
+        self._update_regional_urllc_event()
 
         obs = {}
         rewards = {}
@@ -577,6 +796,12 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 reward_terms = self._compute_tail_risk_reward(throughput_mbps_total, violations, est_delay)
             elif self.reward_mode == "binary_sla_reward":
                 reward_terms = self._compute_binary_sla_reward(throughput_mbps_total, violation_flags, est_delay)
+            elif self.reward_mode == "archive_local_sla":
+                reward_terms = self._compute_archive_local_reward(
+                    achieved_throughput_mbps,
+                    est_delay,
+                    queue_excess > 0.0,
+                )
             elif self.reward_mode == "simple_local_sla":
                 reward_terms = self._compute_simple_local_reward(
                     throughput_mbps_total,
@@ -596,7 +821,6 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
 
             # Update State
             self._update_agent_state(agent)
-            # --- 必须加 min() 保护滤波器不被探索期极值毒害 ---
             self.state[agent][12] = min(float(est_delay), 1.0)
             self.state[agent][13] = min(float(embb_shortfall), float(self.sla_props['embb_gbr']))
             
@@ -610,11 +834,15 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 "throughput": np.sum(achieved_throughput_mbps),
                 "throughput_slices_mbps": achieved_throughput_mbps.astype(np.float32),
                 "embb_eval_tp_mbps": np.float32(embb_eval_tp_mbps),
+                "embb_hotspot_bias_mbps": np.float32(self.embb_hotspot_bias_mbps[agent]),
                 "embb_sla_window_tti": np.int32(self.embb_sla_window_tti),
                 "est_urllc_delay": est_delay,
                 "urllc_delay_ratio": est_delay / self.sla_props["urllc_max_delay"],
+                "regional_urllc_event_active": np.float32(self.regional_urllc_event_active),
+                "regional_urllc_event_affects_agent": np.float32(agent in self._regional_urllc_affected_agents()),
                 "neighbor_prev_action_mean": self._get_neighbor_prev_action_mean(agent),
                 "neighbor_urgency_features": self._get_neighbor_urgency_features(agent),
+                "neighbor_ici_features": self._get_neighbor_ici_features(agent),
                 "local_reward": reward_local,
                 "local_reward_unclipped": np.float32(reward_local_unclipped),
                 "role_reward_scale": np.float32(self._get_role_reward_scale(agent)),
@@ -629,6 +857,10 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 "penalty_mmtc": np.float32(reward_terms["penalty_mmtc"]),
                 "penalty_urllc_yellow": np.float32(reward_terms.get("penalty_urllc_yellow", 0.0)),
                 "penalty_urllc_red": np.float32(reward_terms.get("penalty_urllc_red", 0.0)),
+                "local_archive_violation_flags": np.asarray(
+                    reward_terms.get("local_archive_violation_flags", violation_flags),
+                    dtype=np.float32,
+                ),
                 "penalty_raw": np.array(
                     [
                         reward_terms["penalty_raw_embb"],
@@ -647,34 +879,124 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
                 ),
             }
 
-        # --- Neighbor-Directed Cooperative Reward (MARL) ---
-        # Reward_i = alpha * local_i + (1-alpha) * sum_j(c_ij * local_j)
-        # c_ij is directional coupling from i -> j (urgency-aware + ICI-aware).
-        alpha = self.cooperative_alpha
-        for agent in self.agents:
-            if agent in agent_rewards:
-                neighbor_directed_sum = 0.0
-                neighbor_weight_sum = 0.0
-                source_ratios = ratios_dict.get(agent, self.state[agent][9:12])
-                for neighbor in self.neighbor_map.get(agent, []):
-                    if neighbor not in agent_rewards or neighbor not in infos:
-                        continue
-                    coupling = self._compute_neighbor_directional_coupling(
-                        source_agent=agent,
-                        target_agent=neighbor,
-                        source_ratios=source_ratios,
-                        target_info=infos[neighbor],
-                    )
-                    neighbor_directed_sum += coupling * agent_rewards[neighbor]
-                    neighbor_weight_sum += coupling
+        # --- One-hop Neighborhood Joint Liability + Dividend Reward (MARL) ---
+        # Reward_i = alpha * local_reward_i - beta * P_nbr_i + dividend_i
+        # where:
+        #   P_nbr_i = sum_{j in N(i)} penalty_j / degree_ref
+        #   dividend_i = gate_i * clip(
+        #       gamma * (w_p * max(0, P_nbr_prev_i - P_nbr_i) +
+        #                w_t * max(0, T_nbr_i - T_nbr_prev_i)),
+        #       0, dividend_max
+        #   )
+        alpha = float(self.cooperative_alpha)
+        beta = float(self.neighbor_liability_beta)
+        degree_ref = max(float(self.neighbor_penalty_degree_ref), 1e-6)
+        throughput_norm = max(float(self.binary_reward_throughput_scale) * degree_ref, 1e-6)
+        next_neighbor_penalty_signal = {}
+        next_neighbor_throughput_signal = {}
 
-                reward_local_component = alpha * agent_rewards[agent]
-                reward_neighbor_component = (1 - alpha) * neighbor_directed_sum
-                rewards[agent] = reward_local_component + reward_neighbor_component
-                infos[agent]["neighbor_coop_term"] = np.float32(neighbor_directed_sum)
-                infos[agent]["neighbor_coop_weight_sum"] = np.float32(neighbor_weight_sum)
-                infos[agent]["reward_local_component"] = np.float32(reward_local_component)
-                infos[agent]["reward_neighbor_component"] = np.float32(reward_neighbor_component)
+        for agent in self.agents:
+            if agent not in agent_rewards or agent not in infos:
+                continue
+
+            local_reward_for_coop = float(agent_rewards[agent])
+            local_penalty = float(infos[agent].get("penalty_total", 0.0))
+            local_net_gain = local_reward_for_coop + local_penalty
+
+            neighbor_only_penalty_total = 0.0
+            neighbor_only_throughput_total = 0.0
+            external_neighbor_count = 0
+            for neighbor in self.neighbor_map.get(agent, []):
+                neighbor_info = infos.get(neighbor)
+                if neighbor_info is None:
+                    continue
+                if self.cooperative_target == "embb_only":
+                    neighbor_only_penalty_total += float(neighbor_info.get("penalty_embb", 0.0))
+                    embb_tp = float(neighbor_info.get("embb_eval_tp_mbps", 0.0))
+                    neighbor_only_throughput_total += embb_tp / max(self.sla_props["embb_gbr"], 1e-6)
+                else:
+                    neighbor_only_penalty_total += float(neighbor_info.get("penalty_total", 0.0))
+                    neighbor_only_throughput_total += float(neighbor_info.get("throughput", 0.0))
+                external_neighbor_count += 1
+
+            neighbor_only_penalty_mean = neighbor_only_penalty_total / max(external_neighbor_count, 1)
+            neighbor_penalty_signal = neighbor_only_penalty_total / degree_ref
+            neighbor_throughput_signal = neighbor_only_throughput_total / throughput_norm
+            prev_neighbor_penalty_signal = self.prev_neighbor_penalty_signal.get(agent, neighbor_penalty_signal)
+            prev_neighbor_throughput_signal = self.prev_neighbor_throughput_signal.get(agent, neighbor_throughput_signal)
+            if self.current_step <= 1:
+                prev_neighbor_penalty_signal = neighbor_penalty_signal
+                prev_neighbor_throughput_signal = neighbor_throughput_signal
+            neighbor_penalty_improve = max(0.0, prev_neighbor_penalty_signal - neighbor_penalty_signal)
+            neighbor_throughput_improve = max(0.0, neighbor_throughput_signal - prev_neighbor_throughput_signal)
+            neighborhood_penalty_total = local_penalty + neighbor_only_penalty_total
+            neighborhood_size = 1 + external_neighbor_count
+            neighborhood_penalty_mean = neighborhood_penalty_total / max(neighborhood_size, 1)
+            embb_shortfall_ratio = float(infos[agent].get("violations_raw", np.zeros(3, dtype=np.float32))[0])
+            urllc_delay_ratio = float(infos[agent].get("urllc_delay_ratio", 0.0))
+            urllc_gate_term = urllc_delay_ratio / max(self.neighbor_dividend_gate_urllc_delay_ratio, 1e-6)
+            embb_gate_term = embb_shortfall_ratio / max(self.neighbor_dividend_gate_embb_shortfall_ratio, 1e-6)
+            dividend_gate = float(1.0 / (1.0 + urllc_gate_term + embb_gate_term))
+            neighbor_dividend_raw = float(
+                self.neighbor_dividend_gamma
+                * (
+                    self.neighbor_dividend_penalty_weight * neighbor_penalty_improve
+                    + self.neighbor_dividend_throughput_weight * neighbor_throughput_improve
+                )
+            )
+            neighbor_dividend = float(
+                dividend_gate * np.clip(neighbor_dividend_raw, 0.0, self.neighbor_dividend_max)
+            )
+
+            reward_local_component = alpha * local_reward_for_coop
+            reward_neighbor_component = -beta * neighbor_penalty_signal
+            reward_dividend_component = neighbor_dividend
+            reward_final = reward_local_component + reward_neighbor_component + reward_dividend_component
+            reward_final = self._clip_reward(reward_final)
+            if not np.isfinite(reward_final):
+                reward_final = -100.0
+            rewards[agent] = reward_final
+            next_neighbor_penalty_signal[agent] = neighbor_penalty_signal
+            next_neighbor_throughput_signal[agent] = neighbor_throughput_signal
+
+            infos[agent]["local_reward_for_coop"] = np.float32(local_reward_for_coop)
+            infos[agent]["local_penalty_total"] = np.float32(local_penalty)
+            infos[agent]["local_net_gain"] = np.float32(local_net_gain)
+            infos[agent]["neighbor_only_penalty_total"] = np.float32(neighbor_only_penalty_total)
+            infos[agent]["neighbor_only_penalty_mean"] = np.float32(neighbor_only_penalty_mean)
+            infos[agent]["neighbor_penalty_signal"] = np.float32(neighbor_penalty_signal)
+            infos[agent]["neighbor_throughput_signal"] = np.float32(neighbor_throughput_signal)
+            infos[agent]["neighbor_prev_penalty_signal"] = np.float32(prev_neighbor_penalty_signal)
+            infos[agent]["neighbor_prev_throughput_signal"] = np.float32(prev_neighbor_throughput_signal)
+            infos[agent]["neighbor_penalty_improve"] = np.float32(neighbor_penalty_improve)
+            infos[agent]["neighbor_throughput_improve"] = np.float32(neighbor_throughput_improve)
+            infos[agent]["neighbor_dividend_gate"] = np.float32(dividend_gate)
+            infos[agent]["neighbor_dividend_raw"] = np.float32(neighbor_dividend_raw)
+            infos[agent]["neighbor_dividend"] = np.float32(neighbor_dividend)
+            infos[agent]["neighbor_count"] = np.float32(external_neighbor_count)
+            infos[agent]["neighborhood_penalty_total"] = np.float32(neighborhood_penalty_total)
+            infos[agent]["neighborhood_penalty_mean"] = np.float32(neighborhood_penalty_mean)
+            infos[agent]["neighborhood_size"] = np.float32(neighborhood_size)
+            infos[agent]["cooperative_alpha"] = np.float32(alpha)
+            infos[agent]["cooperative_beta"] = np.float32(beta)
+            infos[agent]["neighbor_penalty_degree_ref"] = np.float32(self.neighbor_penalty_degree_ref)
+            infos[agent]["neighbor_dividend_gamma"] = np.float32(self.neighbor_dividend_gamma)
+            infos[agent]["neighbor_dividend_penalty_weight"] = np.float32(self.neighbor_dividend_penalty_weight)
+            infos[agent]["neighbor_dividend_throughput_weight"] = np.float32(self.neighbor_dividend_throughput_weight)
+            infos[agent]["neighbor_dividend_max"] = np.float32(self.neighbor_dividend_max)
+            infos[agent]["cooperative_target"] = self.cooperative_target
+            infos[agent]["reward_final"] = np.float32(reward_final)
+            # Keep legacy metric names for downstream scripts/dashboards.
+            infos[agent]["neighbor_coop_term"] = np.float32(-neighbor_penalty_signal)
+            infos[agent]["neighbor_coop_weight_sum"] = np.float32(external_neighbor_count)
+            infos[agent]["neighbor_coop_weighted_risk_sum"] = np.float32(neighbor_only_penalty_total)
+            infos[agent]["neighbor_coop_risk_mean"] = np.float32(neighbor_penalty_signal)
+            infos[agent]["reward_local_component"] = np.float32(reward_local_component)
+            infos[agent]["reward_neighbor_component"] = np.float32(reward_neighbor_component)
+            infos[agent]["reward_dividend_component"] = np.float32(reward_dividend_component)
+
+        self.prev_neighbor_penalty_signal.update(next_neighbor_penalty_signal)
+        self.prev_neighbor_throughput_signal.update(next_neighbor_throughput_signal)
 
         # Done flags
         terminateds = {"__all__": self.current_step >= self.max_steps}
@@ -731,78 +1053,53 @@ class MultiCell_5G_SLA_Env(MultiAgentEnv):
     def _get_neighbor_prev_action_mean(self, agent):
         neighbor_ids = self.neighbor_map.get(agent, [])
         if not neighbor_ids:
-            return DEFAULT_INITIAL_SLICE_RATIOS.copy()
+            return np.zeros(3, dtype=np.float32)
 
         prev_actions = np.array([self.state[neighbor][9:12] for neighbor in neighbor_ids], dtype=np.float32)
         return np.mean(prev_actions, axis=0).astype(np.float32)
+
+    def _pool_neighbor_values(self, values) -> float:
+        values_arr = np.asarray(values, dtype=np.float32)
+        if values_arr.size == 0:
+            return 0.0
+        if self.neighbor_urgency_pooling == "max":
+            return float(np.max(values_arr))
+        return float(np.mean(values_arr))
 
     def _get_neighbor_urgency_features(self, agent):
         neighbor_ids = self.neighbor_map.get(agent, [])
         if not neighbor_ids:
             return np.zeros(3, dtype=np.float32)
 
-        neighbor_urllc_queue_mean = float(np.mean([self.queues[neighbor][1] for neighbor in neighbor_ids]))
-        neighbor_urllc_delay_ratio_mean = float(
-            np.mean([self.state[neighbor][12] / self.sla_props["urllc_max_delay"] for neighbor in neighbor_ids])
+        neighbor_urllc_queue_stat = self._pool_neighbor_values(
+            [self.queues[neighbor][1] for neighbor in neighbor_ids]
         )
-        neighbor_embb_shortfall_mean = float(np.mean([self.state[neighbor][13] for neighbor in neighbor_ids]))
+        neighbor_urllc_delay_ratio_stat = self._pool_neighbor_values(
+            [self.state[neighbor][12] / self.sla_props["urllc_max_delay"] for neighbor in neighbor_ids]
+        )
+        neighbor_embb_shortfall_stat = self._pool_neighbor_values(
+            [self.state[neighbor][13] for neighbor in neighbor_ids]
+        )
         return np.array(
-            [neighbor_urllc_queue_mean, neighbor_urllc_delay_ratio_mean, neighbor_embb_shortfall_mean],
+            [neighbor_urllc_queue_stat, neighbor_urllc_delay_ratio_stat, neighbor_embb_shortfall_stat],
             dtype=np.float32,
         )
-
-    def _get_target_slice_urgency(self, target_info):
-        violations_raw = np.asarray(target_info.get("violations_raw", np.zeros(3, dtype=np.float32)), dtype=np.float32)
-        urllc_delay_ratio = float(max(target_info.get("urllc_delay_ratio", 0.0), 0.0))
-        yellow_start = float(np.clip(self.binary_urllc_yellow_start_ratio, 0.0, 0.999999))
-        urllc_yellow_progress = float(
-            np.clip((urllc_delay_ratio - yellow_start) / max(1.0 - yellow_start, 1e-6), 0.0, 1.0)
-        )
-        stress = np.array(
-            [
-                max(float(violations_raw[0]), 0.0),
-                max(float(violations_raw[1]), urllc_yellow_progress),
-                max(float(violations_raw[2]), 0.0),
-            ],
-            dtype=np.float32,
-        )
-        stress_sum = float(np.sum(stress))
-        if stress_sum <= 1e-8:
-            return np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)
-        return (stress / stress_sum).astype(np.float32)
-
-    def _neighbor_normalizer_for_target(self, target_agent):
-        if self.interference_neighbor_normalization == "actual_neighbors":
-            return max(float(len(self.neighbor_map.get(target_agent, []))), 1.0)
-        if self.interference_neighbor_normalization == "fixed_max":
-            return max(float(self.max_neighbors), 1.0)
-        raise ValueError(
-            "Unsupported interference_neighbor_normalization="
-            f"{self.interference_neighbor_normalization!r}"
-        )
-
-    def _compute_neighbor_directional_coupling(self, source_agent, target_agent, source_ratios, target_info):
-        if source_agent not in self.neighbor_map.get(target_agent, []):
-            return 0.0
-
-        source_ratios = np.asarray(source_ratios, dtype=np.float32)
-        urgency = self._get_target_slice_urgency(target_info)
-        normalizer = self._neighbor_normalizer_for_target(target_agent)
-
-        # Directional ICI contribution from source -> target for each slice.
-        directional_slice_load = (self.ici_gain * source_ratios) / normalizer
-        coupling = float(np.dot(directional_slice_load, urgency))
-        return max(coupling, 0.0) * float(self.neighbor_coop_gain)
 
     def _build_obs(self, agent):
         if self.observation_mode == "pure_local":
-            local_obs = np.zeros(14, dtype=np.float32)
-            local_obs[0:14] = self.state[agent]
+            local_obs = np.zeros(9, dtype=np.float32)
+            local_obs[0:3] = self.state[agent][0:3]
+            local_obs[3:6] = self.state[agent][3:6]
+            local_obs[6:9] = self.state[agent][6:9]
         else:
-            local_obs = np.zeros(20, dtype=np.float32)
-            local_obs[0:14] = self.state[agent]
-            local_obs[14:17] = self._get_neighbor_prev_action_mean(agent)
-            local_obs[17:20] = self._get_neighbor_urgency_features(agent)
+            local_obs = np.zeros(self.local_obs_dim, dtype=np.float32)
+            local_obs[0:3] = self.state[agent][0:3]
+            local_obs[3:6] = self.state[agent][3:6]
+            local_obs[6:9] = self.state[agent][6:9]
+            local_obs[9:12] = self._get_neighbor_prev_action_mean(agent)
+            local_obs[12:15] = self._get_neighbor_urgency_features(agent)
+            if self.include_ici_features:
+                local_obs[15:19] = self._get_neighbor_ici_features(agent)
 
         if not self.use_centralized_critic:
             return np.nan_to_num(local_obs, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)

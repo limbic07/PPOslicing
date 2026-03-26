@@ -21,6 +21,13 @@ def _extract_metrics(record):
     center_embb_sla_ok = custom_metrics.get("center_embb_sla_ok")
     center_urllc_sla_ok = custom_metrics.get("center_urllc_sla_ok")
     center_mmtc_sla_ok = custom_metrics.get("center_mmtc_sla_ok")
+    system_embb_viol = custom_metrics.get("system_embb_violations")
+    system_urllc_viol = custom_metrics.get("system_urllc_violations")
+    system_mmtc_viol = custom_metrics.get("system_mmtc_violations")
+    system_embb_sla_ok = custom_metrics.get("system_embb_sla_ok")
+    system_urllc_sla_ok = custom_metrics.get("system_urllc_sla_ok")
+    system_mmtc_sla_ok = custom_metrics.get("system_mmtc_sla_ok")
+    system_total_sla_viol = custom_metrics.get("system_total_sla_violations")
     center_reward_base_tp = custom_metrics.get("center_reward_base_tp")
     system_throughput_mbps = custom_metrics.get("system_throughput_mbps")
 
@@ -33,6 +40,13 @@ def _extract_metrics(record):
         "center_embb_sla_ok": float(center_embb_sla_ok) if center_embb_sla_ok is not None else None,
         "center_urllc_sla_ok": float(center_urllc_sla_ok) if center_urllc_sla_ok is not None else None,
         "center_mmtc_sla_ok": float(center_mmtc_sla_ok) if center_mmtc_sla_ok is not None else None,
+        "system_embb_violations": float(system_embb_viol) if system_embb_viol is not None else None,
+        "system_urllc_violations": float(system_urllc_viol) if system_urllc_viol is not None else None,
+        "system_mmtc_violations": float(system_mmtc_viol) if system_mmtc_viol is not None else None,
+        "system_embb_sla_ok": float(system_embb_sla_ok) if system_embb_sla_ok is not None else None,
+        "system_urllc_sla_ok": float(system_urllc_sla_ok) if system_urllc_sla_ok is not None else None,
+        "system_mmtc_sla_ok": float(system_mmtc_sla_ok) if system_mmtc_sla_ok is not None else None,
+        "system_total_sla_violations": float(system_total_sla_viol) if system_total_sla_viol is not None else None,
         "center_reward_base_tp": float(center_reward_base_tp) if center_reward_base_tp is not None else None,
         "system_throughput_mbps": float(system_throughput_mbps) if system_throughput_mbps is not None else None,
     }
@@ -41,6 +55,8 @@ def _extract_metrics(record):
         metrics.get("center_urllc_violations"),
         metrics.get("center_mmtc_violations"),
     )
+    if metrics["system_total_sla_violations"] is None:
+        metrics["system_total_sla_violations"] = _compute_system_total_violation(metrics)
     metrics["quality_score"] = _compute_quality_score(metrics)
     return metrics
 
@@ -167,6 +183,22 @@ def _normalize_violation(violation, decay):
     return math.exp(-decay * violation)
 
 
+def _compute_system_total_violation(metrics):
+    system_slice_ok = [
+        metrics.get("system_embb_sla_ok"),
+        metrics.get("system_urllc_sla_ok"),
+        metrics.get("system_mmtc_sla_ok"),
+    ]
+    if all(value is not None for value in system_slice_ok):
+        return float(sum(max(0.0, 1.0 - float(value)) for value in system_slice_ok))
+
+    return _sum_available_violations(
+        metrics.get("system_embb_violations"),
+        metrics.get("system_urllc_violations"),
+        metrics.get("system_mmtc_violations"),
+    )
+
+
 def _normalize_urllc_delay(delay_ms, budget_ms=2.0, decay=1.0):
     if delay_ms is None:
         return None
@@ -184,7 +216,9 @@ def _normalize_episode_return(episode_return_mean, scale=1000.0):
 def _compute_quality_score(metrics):
     # Violation-first quality summary:
     # total SLA violation is dominant, throughput is secondary.
-    total_violation = metrics.get("center_total_sla_violations")
+    total_violation = metrics.get("system_total_sla_violations")
+    if total_violation is None:
+        total_violation = metrics.get("center_total_sla_violations")
     violation_quality = _normalize_violation(total_violation, decay=1.0)
     throughput_quality = _normalize_throughput_metric(metrics)
     return_quality = _normalize_episode_return(metrics.get("episode_return_mean"))
@@ -206,10 +240,15 @@ def _compute_quality_score(metrics):
 def _ranking_key(item):
     # Violation-first selection: lowest total SLA violation wins.
     # Throughput is the secondary criterion (system throughput preferred).
-    total_viol = item.get("center_total_sla_violations")
+    total_viol = item.get("system_total_sla_violations")
+    if total_viol is None:
+        total_viol = item.get("center_total_sla_violations")
     system_tp = item.get("system_throughput_mbps")
     throughput_metric = _select_throughput_metric(item)
     quality = item.get("quality_score")
+    system_embb_viol = item.get("system_embb_violations")
+    system_urllc_viol = item.get("system_urllc_violations")
+    system_mmtc_viol = item.get("system_mmtc_violations")
     urllc_viol = item.get("center_urllc_violations")
     embb_viol = item.get("center_embb_violations")
     mmtc_viol = item.get("center_mmtc_violations")
@@ -226,6 +265,12 @@ def _ranking_key(item):
         -(throughput_metric if throughput_metric is not None else float("-inf")),
         0 if quality is not None else 1,
         -(quality if quality is not None else float("-inf")),
+        0 if system_urllc_viol is not None else 1,
+        system_urllc_viol if system_urllc_viol is not None else float("inf"),
+        0 if system_embb_viol is not None else 1,
+        system_embb_viol if system_embb_viol is not None else float("inf"),
+        0 if system_mmtc_viol is not None else 1,
+        system_mmtc_viol if system_mmtc_viol is not None else float("inf"),
         0 if urllc_viol is not None else 1,
         urllc_viol if urllc_viol is not None else float("inf"),
         0 if delay is not None else 1,
@@ -281,6 +326,13 @@ def _collect_ranked_checkpoints(experiment_dirs, min_training_iteration):
                         "center_embb_sla_ok": metrics.get("center_embb_sla_ok"),
                         "center_urllc_sla_ok": metrics.get("center_urllc_sla_ok"),
                         "center_mmtc_sla_ok": metrics.get("center_mmtc_sla_ok"),
+                        "system_embb_violations": metrics.get("system_embb_violations"),
+                        "system_urllc_violations": metrics.get("system_urllc_violations"),
+                        "system_mmtc_violations": metrics.get("system_mmtc_violations"),
+                        "system_embb_sla_ok": metrics.get("system_embb_sla_ok"),
+                        "system_urllc_sla_ok": metrics.get("system_urllc_sla_ok"),
+                        "system_mmtc_sla_ok": metrics.get("system_mmtc_sla_ok"),
+                        "system_total_sla_violations": metrics.get("system_total_sla_violations"),
                         "center_reward_base_tp": metrics.get("center_reward_base_tp"),
                         "system_throughput_mbps": metrics.get("system_throughput_mbps"),
                         "quality_score": metrics.get("quality_score"),

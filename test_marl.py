@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 import warnings
@@ -6,15 +7,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import ray
 import torch
-from ray.rllib.core import Columns
 from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.core import Columns
 from ray.tune.registry import register_env
 
 from checkpoint_utils import rank_checkpoints_by_metric
 from ippo_rl_module import (
     CENTRALIZED_CRITIC_GLOBAL_DIM,
     DEFAULT_INITIAL_ACTION_LOG_STD,
-    DEFAULT_INITIAL_SLICE_RATIOS,
     build_initialized_rl_module_spec,
 )
 from multi_cell_env import MultiCell_5G_SLA_Env
@@ -27,67 +27,108 @@ logging.getLogger("ray").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-EVAL_SEED = 2026
-TRAIN_SEEDS = [2026, 2027, 2028]
-ENV_PROFILE = "balanced"
-ALGO_MODE = "ippo"  # ippo | mappo
-if ALGO_MODE == "mappo":
-    OBSERVATION_MODE = "neighbor_augmented"
-    USE_CENTRALIZED_CRITIC = True
-    COOPERATIVE_ALPHA = 0.7
-    EXPERIMENT_ENV_TAG = "balanced_mappo_ctde_v1"
-else:
-    OBSERVATION_MODE = "pure_local"
-    USE_CENTRALIZED_CRITIC = False
-    COOPERATIVE_ALPHA = 1.0
-    EXPERIMENT_ENV_TAG = "balanced_ippo_v1"
-MIN_BEST_CHECKPOINT_ITER = 50
-EXPERIMENT_DIRS = [f"./ray_results/MAPPO_5G_Slicing_{EXPERIMENT_ENV_TAG}_seed{seed}" for seed in TRAIN_SEEDS]
-ENV_CONFIG = {
-    "env_profile": ENV_PROFILE,
-    "observation_mode": OBSERVATION_MODE,
-    "use_centralized_critic": USE_CENTRALIZED_CRITIC,
-    "cooperative_alpha": COOPERATIVE_ALPHA,
-    "centralized_critic_global_dim": CENTRALIZED_CRITIC_GLOBAL_DIM,
-    "action_softmax_temperature": 3.0,
-    "penalty_weight": 0.7,
-    "w_embb": 1.0,
-    "w_urllc": 0.30,
-    "w_mmtc": 0.7,
-    "urllc_warning_ratio": 0.90,
-    "urllc_tail_ratio": 0.92,
-    "urllc_softplus_slope": 10.0,
-    "urllc_warning_gain": 0.20,
-    "urllc_tail_quad_gain": 2.0,
-    "urllc_hard_violation_gain": 1.75,
-    "urllc_overflow_gain": 2.2,
-    "urllc_exp_coeff": 1.6,
-    "urllc_penalty_cap_factor": 10.0,
-    "embb_penalty_quad_gain": 2.5,
-    "embb_penalty_cubic_gain": 1.2,
-    "embb_penalty_cap_factor": 16.0,
-    "mmtc_penalty_cap_factor": 5.0,
-    "embb_violation_cap": 2.0,
-    "urllc_violation_cap": 5.0,
-    "mmtc_violation_cap": 2.0,
-    "embb_gbr": 220.0,
-    "urllc_burst_start_prob": 0.06,
-    "urllc_burst_end_prob": 0.35,
-    "urllc_burst_mean_mbps": 100.0,
-    "urllc_burst_std_mbps": 15.0,
-    "binary_reward_throughput_scale": 80.0,
-    "binary_penalty_embb": 4.0,
-    "binary_penalty_urllc": 6.0,
-    "binary_penalty_mmtc": 4.0,
-    "binary_urllc_yellow_start_ratio": 0.5,
-    "binary_urllc_yellow_penalty": 6.0,
-    "tail_reward_throughput_weight": 1.0 / 300.0,
-    "center_reward_scale": 1.0,
-    "reward_clip_abs": 0.0,
+DEFAULT_EVAL_SEED = 2026
+DEFAULT_TRAIN_SEEDS = [2026, 2027, 2028]
+DEFAULT_ENV_PROFILE = "balanced"
+DEFAULT_ALGO_MODE = "mappo"
+DEFAULT_MIN_BEST_CHECKPOINT_ITER = 50
+
+IPPO_EXPERIMENT_TAGS = {
+    "harsh": "harsh_ippo_v2",
+    "balanced": "balanced_ippo_v5",
 }
+MAPPO_EXPERIMENT_TAGS = {
+    "harsh": "harsh_mappo_ctde_v3",
+    "balanced": "balanced_mappo_ctde_v5",
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate trained IPPO/MAPPO checkpoint.")
+    parser.add_argument(
+        "--algo-mode",
+        choices=["ippo", "mappo"],
+        default=DEFAULT_ALGO_MODE,
+        help="ippo: pure local baseline; mappo: CTDE mode.",
+    )
+    parser.add_argument(
+        "--env-profile",
+        choices=["harsh", "balanced"],
+        default=DEFAULT_ENV_PROFILE,
+        help="Environment profile used during training.",
+    )
+    parser.add_argument(
+        "--eval-seed",
+        type=int,
+        default=DEFAULT_EVAL_SEED,
+        help="Evaluation seed for rollout.",
+    )
+    parser.add_argument(
+        "--train-seeds",
+        nargs="+",
+        type=int,
+        default=DEFAULT_TRAIN_SEEDS,
+        help="Training seeds used to search checkpoint directories.",
+    )
+    parser.add_argument(
+        "--min-best-iter",
+        type=int,
+        default=DEFAULT_MIN_BEST_CHECKPOINT_ITER,
+        help="Minimum training iteration when selecting best checkpoint.",
+    )
+    return parser.parse_args()
+
+
+def resolve_algo_mode(algo_mode: str):
+    mode = str(algo_mode).lower()
+    if mode == "mappo":
+        return {
+            "observation_mode": "neighbor_augmented",
+            "use_centralized_critic": True,
+            "cooperative_alpha": None,
+            "neighbor_liability_beta": None,
+            "neighbor_dividend_gamma": None,
+        }
+    return {
+        "observation_mode": "pure_local",
+        "use_centralized_critic": False,
+        "cooperative_alpha": 1.0,
+        "neighbor_liability_beta": 0.0,
+        "neighbor_dividend_gamma": 0.0,
+    }
+
+
+def resolve_experiment_tag(env_profile: str, algo_mode: str) -> str:
+    profile = str(env_profile).lower()
+    mode = str(algo_mode).lower()
+    tags = MAPPO_EXPERIMENT_TAGS if mode == "mappo" else IPPO_EXPERIMENT_TAGS
+    if profile not in tags:
+        raise ValueError(f"Unsupported env_profile={env_profile!r}")
+    return tags[profile]
+
+
+def build_env_config(env_profile: str, algo_mode: str) -> dict:
+    mode_cfg = resolve_algo_mode(algo_mode)
+    profile_overrides = MultiCell_5G_SLA_Env._get_env_profile_overrides(env_profile)
+    env_config = {
+        "env_profile": env_profile,
+        "observation_mode": mode_cfg["observation_mode"],
+        "use_centralized_critic": mode_cfg["use_centralized_critic"],
+        "centralized_critic_global_dim": CENTRALIZED_CRITIC_GLOBAL_DIM,
+        "action_softmax_temperature": float(profile_overrides.get("action_softmax_temperature", 1.0)),
+    }
+    if mode_cfg["cooperative_alpha"] is not None:
+        env_config["cooperative_alpha"] = mode_cfg["cooperative_alpha"]
+    if mode_cfg["neighbor_liability_beta"] is not None:
+        env_config["neighbor_liability_beta"] = mode_cfg["neighbor_liability_beta"]
+    if mode_cfg["neighbor_dividend_gamma"] is not None:
+        env_config["neighbor_dividend_gamma"] = mode_cfg["neighbor_dividend_gamma"]
+    return env_config
+
 
 def env_creator(env_config):
     return MultiCell_5G_SLA_Env(config=env_config)
+
 
 register_env("MultiCell_5G_SLA_Env", env_creator)
 
@@ -108,26 +149,47 @@ def compute_action_new_stack(algo, obs: np.ndarray, policy_id: str) -> np.ndarra
 
     return np.clip(action, -1.0, 1.0)
 
+
 def run_test():
+    args = parse_args()
+    experiment_tag = resolve_experiment_tag(args.env_profile, args.algo_mode)
+    experiment_dirs = [
+        f"./ray_results/MAPPO_5G_Slicing_{experiment_tag}_seed{seed}"
+        for seed in args.train_seeds
+    ]
+    env_config = build_env_config(args.env_profile, args.algo_mode)
+    mode_cfg = resolve_algo_mode(args.algo_mode)
+
+    print(
+        f"Testing mode={args.algo_mode}, env_profile={args.env_profile}, "
+        f"observation_mode={mode_cfg['observation_mode']}, "
+        f"use_centralized_critic={mode_cfg['use_centralized_critic']}, "
+        f"cooperative_alpha={mode_cfg['cooperative_alpha'] if mode_cfg['cooperative_alpha'] is not None else 'profile'}, "
+        f"neighbor_liability_beta={mode_cfg['neighbor_liability_beta'] if mode_cfg['neighbor_liability_beta'] is not None else 'profile'}, "
+        f"neighbor_dividend_gamma={mode_cfg['neighbor_dividend_gamma'] if mode_cfg['neighbor_dividend_gamma'] is not None else 'profile'}, "
+        f"experiment_tag={experiment_tag}, eval_seed={args.eval_seed}"
+    )
+
     ray.init(ignore_reinit_error=True)
-    
-    # Needs to match training config
+
     config = (
         PPOConfig()
-        .environment("MultiCell_5G_SLA_Env", env_config=ENV_CONFIG)
+        .environment("MultiCell_5G_SLA_Env", env_config=env_config)
         .framework("torch")
         .api_stack(enable_rl_module_and_learner=True, enable_env_runner_and_connector_v2=True)
-        .debugging(seed=EVAL_SEED)
+        .debugging(seed=args.eval_seed)
         .rl_module(
             rl_module_spec=build_initialized_rl_module_spec(
-                ENV_CONFIG["action_softmax_temperature"],
+                env_config["action_softmax_temperature"],
                 fcnet_hiddens=[256, 256],
-                fcnet_activation="relu",
-                initial_action_ratios=DEFAULT_INITIAL_SLICE_RATIOS,
+                fcnet_activation="tanh",
                 initial_action_log_std=DEFAULT_INITIAL_ACTION_LOG_STD,
-                observation_mode=ENV_CONFIG["observation_mode"],
-                use_centralized_critic=bool(ENV_CONFIG.get("use_centralized_critic", False)),
-                critic_global_dim=int(ENV_CONFIG.get("centralized_critic_global_dim", CENTRALIZED_CRITIC_GLOBAL_DIM)),
+                observation_mode=env_config["observation_mode"],
+                include_ici_features=bool(env_config.get("neighbor_augmented_include_ici_features", False)),
+                use_centralized_critic=bool(env_config.get("use_centralized_critic", False)),
+                critic_global_dim=int(
+                    env_config.get("centralized_critic_global_dim", CENTRALIZED_CRITIC_GLOBAL_DIM)
+                ),
             )
         )
         .multi_agent(
@@ -137,16 +199,16 @@ def run_test():
         .env_runners(observation_filter="MeanStdFilter", num_env_runners=0)
         .learners(num_learners=0)
     )
-    
+
     algo = config.build()
     ranked_checkpoints = rank_checkpoints_by_metric(
-        EXPERIMENT_DIRS,
-        min_training_iteration=MIN_BEST_CHECKPOINT_ITER,
-        fallback_to_any=True,
+        experiment_dirs,
+        min_training_iteration=args.min_best_iter,
+        fallback_to_any=False,
     )
     if not ranked_checkpoints:
         raise FileNotFoundError(
-            "No ranked checkpoints found in IPPO seed experiment dirs. "
+            f"No ranked checkpoints found in {args.algo_mode.upper()} seed experiment dirs. "
             "Please run train_marl.py first."
         )
 
@@ -187,16 +249,16 @@ def run_test():
             f"Sample restore errors:\n{error_preview}"
         )
 
-    env = MultiCell_5G_SLA_Env(config=ENV_CONFIG)
-    obs, _ = env.reset(seed=EVAL_SEED)
-    
+    env = MultiCell_5G_SLA_Env(config=env_config)
+    obs, _ = env.reset(seed=args.eval_seed)
+
     rewards_history = {agent: [] for agent in env.agents}
     throughput_history = {agent: [] for agent in env.agents}
     urllc_delay_history = {agent: [] for agent in env.agents}
-    
+
     done = {"__all__": False}
     step = 0
-    
+
     print("Running evaluation...")
     while not done["__all__"] and step < 200:
         actions = {}
@@ -204,22 +266,20 @@ def run_test():
             policy_id = policy_mapping_fn(agent_id)
             actions[agent_id] = compute_action_new_stack(algo, agent_obs, policy_id=policy_id)
 
-            
         obs, rewards, terminateds, truncateds, infos = env.step(actions)
-        
+
         for agent in env.agents:
             if agent in rewards:
                 rewards_history[agent].append(rewards[agent])
                 throughput_history[agent].append(infos[agent]["throughput"])
-                urllc_delay_history[agent].append(infos[agent]["est_urllc_delay"] * 1000) # ms
-                
+                urllc_delay_history[agent].append(infos[agent]["est_urllc_delay"] * 1000)
+
         done = terminateds
         step += 1
 
     print("Plotting results...")
     plt.figure(figsize=(15, 10))
-    
-    # Plot 1: Center Cell (BS_0) vs Avg Edge Cell Throughput
+
     plt.subplot(2, 2, 1)
     plt.plot(throughput_history["BS_0"], label="Center Cell (BS_0) Throughput")
     avg_edge_throughput = np.mean([throughput_history[f"BS_{i}"] for i in range(1, 7)], axis=0)
@@ -229,18 +289,16 @@ def run_test():
     plt.ylabel("Throughput (Mbps)")
     plt.legend()
     plt.grid(True)
-    
-    # Plot 2: Center Cell URLLC Delay
+
     plt.subplot(2, 2, 2)
-    plt.plot(urllc_delay_history["BS_0"], label="BS_0 URLLC Delay", color='red')
-    plt.axhline(y=2.0, color='black', linestyle='--', label='2ms Deadline')
+    plt.plot(urllc_delay_history["BS_0"], label="BS_0 URLLC Delay", color="red")
+    plt.axhline(y=2.0, color="black", linestyle="--", label="2ms Deadline")
     plt.title("Center Cell URLLC Delay")
     plt.xlabel("Step")
     plt.ylabel("Delay (ms)")
     plt.legend()
     plt.grid(True)
-    
-    # Plot 3: Cumulative Rewards
+
     plt.subplot(2, 2, 3)
     plt.plot(np.cumsum(rewards_history["BS_0"]), label="BS_0 Reward")
     avg_edge_reward = np.mean([np.cumsum(rewards_history[f"BS_{i}"]) for i in range(1, 7)], axis=0)
@@ -250,13 +308,14 @@ def run_test():
     plt.ylabel("Cumulative Reward")
     plt.legend()
     plt.grid(True)
-    
+
     os.makedirs("./results", exist_ok=True)
     plt.tight_layout()
     plt.savefig("./results/marl_evaluation.png")
     print("Results saved to ./results/marl_evaluation.png")
     algo.stop()
     ray.shutdown()
-    
+
+
 if __name__ == "__main__":
     run_test()

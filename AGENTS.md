@@ -5,7 +5,7 @@
 本项目目标：基于 **Ray RLlib（new API stack）** 的多智能体训练，解决 5G/6G 多小区网络切片资源分配与 SLA 保障问题。
 
 ## 0. 分支边界（重要）
-- 本分支仅维护多智能体路线：`multi_cell_env.py`、`train_marl.py`、`test_marl.py`、`compare_marl_baseline.py`、`smoke_test_trained_model.py`、`checkpoint_utils.py`、`ippo_rl_module.py`。
+- 本分支仅维护多智能体路线：`multi_cell_env.py`、`train_marl.py`、`test_marl.py`、`compare_marl_baseline.py`、`checkpoint_utils.py`、`ippo_rl_module.py`。
 - 单智能体旧方案归档在 `archive/`，不作为本分支主线维护对象。
 
 ---
@@ -23,27 +23,31 @@ python train_marl.py
 ```
 - 当前默认等价于：
 ```bash
-python train_marl.py --mode full --hw-profile balanced --env-profile balanced --algo-mode ippo --observation-mode pure_local
+python train_marl.py --mode full --hw-profile balanced --env-profile balanced --algo mappo
 ```
-- 默认训练计划：`full + balanced(hw) + balanced(env) + pure_local(IPPO) + seed=[2026] + 200 iterations`。
+- 默认训练计划：`full + balanced(hw) + balanced(env) + MAPPO(CTDE, coop参数跟随profile) + seed=[2026] + 200 iterations`。
 - 常用切换：
 ```bash
 python train_marl.py --mode quick
 python train_marl.py --mode full --env-profile harsh
-python train_marl.py --mode full --observation-mode pure_local
-python train_marl.py --mode full --observation-mode neighbor_augmented
-python train_marl.py --mode full --algo-mode mappo
-python train_marl.py --mode full --observation-mode neighbor_augmented --use-centralized-critic
+python train_marl.py --mode full --algo ippo
+python train_marl.py --mode full --algo mappo
+python train_marl.py --mode full --algo mappo --mappo-variant beta_gamma
+python train_marl.py --mode full --algo mappo --mappo-variant coop_embb
+python train_marl.py --mode full --algo mappo --mappo-variant coop_embb_ici
+python train_marl.py --mode full --algo mappo --alpha 0.5 --beta 0.35
 python train_marl.py --mode full --seeds 2026 2027 2028
 python train_marl.py --mode full --hw-profile maxperf
 python train_marl.py --mode full --iters 120
 ```
+- 兼容性说明：`--algo-mode`、`--mappo-cooperative-alpha`、`--neighbor-liability-beta` 仍可用但已废弃，建议改用 `--algo/--alpha/--beta`。
 
 ### 1.3 评估与对比（MARL）
 ```bash
 python test_marl.py
 python compare_marl_baseline.py
-python smoke_test_trained_model.py
+python test_marl.py --algo-mode ippo
+python test_marl.py --algo-mode mappo
 ```
 
 ### 1.4 代码格式化与检查
@@ -97,24 +101,22 @@ flake8 . --max-line-length=120
 - 每个 agent 动作：`spaces.Box(-1.0, 1.0, shape=(3,))`。
 - 环境 `step()` 中映射规则：
   - 温度缩放 `Softmax`：`ratios = softmax(action * temperature)`
-  - 当前默认 `action_softmax_temperature = 3.0`
+  - 当前主线默认 `action_softmax_temperature = 1.0`
   - 不再使用旧的线性变换 + 裁剪映射。
 
 ### 3.3 观测空间（Observation Space）
 - 当前支持两种模式：
-  - `pure_local`：**14 维**，纯本地 IPPO 基线，不含任何邻居信息
-  - `neighbor_augmented`：**20 维**，用于后续协同增强实验
-- `pure_local` 14 维：
+  - `pure_local`：**9 维**，纯本地 IPPO 基线，不含任何邻居信息
+  - `neighbor_augmented`：**15 维**，用于后续协同增强实验
+- `pure_local` 9 维：
   - `[0:3]` Demand/Arrivals
   - `[3:6]` Queue Backlog
   - `[6:9]` Spectral Efficiency
-  - `[9:12]` Previous Ratios
-  - `[12]` URLLC Estimated Delay
-  - `[13]` eMBB GBR Shortfall
-- `neighbor_augmented` 20 维：
-  - `[0:14]` 纯本地 14 维
-  - `[14:17]` 邻居上一时刻动作均值（neighbor previous-action mean）
-  - `[17:20]` 邻居紧急度统计（URLLC queue mean / URLLC delay-ratio mean / eMBB shortfall mean）
+- `neighbor_augmented` 15 维：
+  - `[0:9]` 纯本地 9 维
+  - `[9:12]` 邻居上一时刻动作均值（neighbor previous-action mean）
+  - `[12:15]` 邻居紧急度统计（默认使用 `max` 聚合，保留极端危机信号，不再默认 `mean` 稀释）
+- 若启用 `neighbor_augmented_include_ici_features=True`，则追加 4 维 ICI 特征，总计 **19 维**
 - 环境直接输出原始物理量（raw physical values），不再在环境内部做手工除法缩放。
 - 观测归一化统一交给 RLlib `MeanStdFilter`。
 
@@ -124,11 +126,7 @@ flake8 . --max-line-length=120
   - `center_policy`：`BS_0`
   - `edge_policy`：`BS_1 ~ BS_6`
 - `policy_mapping_fn` 必须与训练/测试/评估保持一致。
-- 当前纯本地 IPPO 主线使用显式 actor 初始先验：
-  - 目标首步分配偏好：`[0.4, 0.4, 0.2]`
-  - 通过 `Softmax^{-1}` 映射为初始 raw action mean
-  - 初始 `log_std = -1.5`
-  - 逻辑统一封装在 `ippo_rl_module.py`
+- 当前已删除显式 actor 分配比例先验，不再对首步动作注入 `0.4/0.4/0.2` 偏置。
 
 ### 3.5 当前主线定位
 - 当前基础路线是 **纯本地 IPPO（pure_local）**：
@@ -136,19 +134,34 @@ flake8 . --max-line-length=120
   - 无邻居观测（neighbor information）
   - 作为 baseline 训练时固定 `cooperative_alpha = 1.0`（纯本地奖励）
 - 已支持可选 **CTDE（MAPPO-style）** 开关：
-  - 推荐通过 `--algo-mode mappo` 启用（会自动启用 `neighbor_augmented + centralized critic`）
-  - 也可手工使用 `--observation-mode neighbor_augmented --use-centralized-critic`
-  - `MAPPO` 训练时固定 `cooperative_alpha = 0.7`（局部+全局均值混合）
-  - 协作项采用“邻居定向 + 邻居求和”（不使用反事实/差分奖励）
+  - 推荐通过 `--algo mappo` 启用（自动启用 `neighbor_augmented + centralized critic`）
+  - `MAPPO` 训练默认使用 `env_profile` 内的协作参数（`cooperative_alpha / neighbor_liability_beta / neighbor_dividend_gamma`）
+  - 仅当显式传参时才覆盖：`--alpha`、`--beta`、`--gamma`
+  - 支持四组快速 MAPPO 变体：
+    - `current`
+    - `beta_gamma`
+    - `coop_embb`
+    - `coop_embb_ici`
+  - 协作项采用“一跳邻居连坐 + 邻居繁荣分红（Neighborhood Dividend）”：
+    `reward_i = alpha*local_reward_i - beta*P_nbr_i + dividend_i`
+    `P_nbr_i = sum_{j in N(i)} penalty_j / degree_ref`（默认 `degree_ref=3`）
+    `dividend_i = gate_i * clip(gamma*(w_p*ΔP_i^+ + w_t*ΔT_i^+), 0, D_max)`
+    其中 `gate_i = 1 / (1 + urllc_delay_ratio/th_u + embb_shortfall_ratio/th_e)`（连续门控，避免早期梯度归零）
+    默认：`gamma=1.0, w_p=1.0, w_t=0.25, D_max=1.5, th_u=0.85, th_e=0.10`
   - actor 仅使用本地观测，critic 使用集中上下文特征
+  - 新增可选协作目标 `cooperative_target=embb_only`，保持本地三 SLA reward 不变，只将邻居协作项聚焦到 eMBB
+  - 新增可选 `neighbor_augmented_include_ici_features=True`，向 actor 暴露同切片邻区负载与估计 ICI 折损
 - `neighbor_augmented` 仅作为后续从 IPPO 走向更强协同方法的过渡模式，不作为当前默认主线。
 
 ### 3.6 奖励函数（Reward Function）
 - `harsh` 仍保留旧的连续惩罚/tail-risk 逻辑，用于压力测试。
-- `balanced` 主线已切回单智能体风格的极简二值 reward：
-  - `reward = total_throughput_mbps / 100 - 10*eMBB_flag - 20*URLLC_flag - 10*mMTC_flag`
-  - `violations` 继续保留连续比例用于分析与绘图
-  - reward 只看布尔违约标志（`violation_flags`）
+- `balanced` 主线 local reward 已切回 archive 单智能体 PPO 风格：
+  - `local_reward = total_throughput_mbps / 100 - 10*eMBB_flag_local - 20*URLLC_flag_local - 10*mMTC_flag_local`
+  - 其中 `flag_local` 按单步本地条件计算：
+    - `eMBB`：当前步 eMBB 吞吐是否低于 GBR
+    - `URLLC`：当前估计时延是否超阈
+    - `mMTC`：当前队列是否溢出
+  - 系统级 `violations / violation_flags` 仍保留当前物理口径，用于分析与 baseline 评估
 - 当前 ENV_CONFIG（train/test/compare 同步）为：
   - `penalty_weight=0.7`
   - `w_embb=1.0, w_urllc=0.30, w_mmtc=0.7`
@@ -158,13 +171,11 @@ flake8 . --max-line-length=120
   - `embb_penalty_quad_gain=2.5, embb_penalty_cubic_gain=1.2, embb_penalty_cap_factor=16.0`
   - `mmtc_penalty_cap_factor=5.0`
   - `embb_violation_cap=2.0, urllc_violation_cap=5.0, mmtc_violation_cap=2.0`
-- `balanced` 环境下，训练奖励改为 binary SLA reward：
-  - profile 默认 `cooperative_alpha = 0.7`
-  - 训练模式隔离：`IPPO -> cooperative_alpha=1.0`，`MAPPO -> cooperative_alpha=0.7`
-  - `binary_reward_throughput_scale = 80.0`
-  - `binary_penalty_embb/urllc/mmtc = 4 / 6 / 4`
-  - `binary_urllc_yellow_start_ratio = 0.5`（1ms 黄灯起点，2ms 红线）
-  - `binary_urllc_yellow_penalty = 6.0`（黄灯区随延迟线性增加）
+- `balanced` 环境下，训练 local reward 当前使用 archive-style local SLA reward：
+  - 环境 profile 基线值：`cooperative_alpha = 0.5`, `neighbor_liability_beta = 0.5`, `neighbor_dividend_gamma = 1.0`
+  - 训练模式隔离：
+    `IPPO -> cooperative_alpha=1.0, neighbor_liability_beta=0.0`
+    `MAPPO -> 默认跟随 env_profile；若显式传参，则 --alpha/--beta 覆盖`
   - `center_reward_scale = 1.0`
   - `reward_clip_abs = 0.0`
 
@@ -172,6 +183,15 @@ flake8 . --max-line-length=120
 - 环境 `info` 已输出：
   - `reward_base_tp`, `local_reward`, `penalty_total`
   - `local_reward_unclipped`, `role_reward_scale`
+  - `local_reward_for_coop`, `local_penalty_total`, `local_net_gain`
+  - `neighbor_only_penalty_total`, `neighbor_only_penalty_mean`, `neighbor_count`
+  - `neighborhood_penalty_total`, `neighborhood_penalty_mean`, `neighborhood_size`
+  - `cooperative_alpha`, `cooperative_beta`, `reward_final`
+  - `neighbor_coop_term`, `neighbor_coop_weight_sum`, `neighbor_coop_weighted_risk_sum`, `neighbor_coop_risk_mean`
+  - `neighbor_penalty_signal`, `neighbor_prev_penalty_signal`, `neighbor_penalty_improve`
+  - `neighbor_throughput_signal`, `neighbor_prev_throughput_signal`, `neighbor_throughput_improve`
+  - `neighbor_dividend_gate`, `neighbor_dividend_raw`, `neighbor_dividend`
+  - `reward_dividend_component`
   - `violations`（封顶后的训练/评估用违规比例）
   - `violations_raw`（原始物理违规比例，仅用于分析）
   - `violation_flags`（reward 实际使用的布尔违约标志）
@@ -182,15 +202,18 @@ flake8 . --max-line-length=120
 
 ### 3.8 `balanced` 环境定义
 - `balanced` 当前设置：
-  - `eMBB GBR = 220 Mbps`
+  - `eMBB GBR = 200 Mbps`
   - `URLLC max delay = 2 ms`
   - `mMTC max queue = 1.0`
 - 环境动力学与评估口径：
-  - `URLLC burst` 增强：`start_prob=0.06`, `end_prob=0.35`, `burst_mean=100 Mbps`, `burst_std=15 Mbps`
-  - `ICI` 设为中等偏强：`ici_gain=0.50`, `se_modifier_floor=0.45`
+  - `URLLC burst` 增强：`start_prob=0.06`, `end_prob=0.25`, `burst_mean=100 Mbps`, `burst_std=15 Mbps`
+  - `ICI` 设为中等强度：`ici_gain=0.42`, `se_modifier_floor=0.50`
   - `ICI` 归一化：`actual_neighbors`
-  - `eMBB` 从逐 TTI 硬判改为 `8 TTI` 滑动平均吞吐评估
-  - 动作映射：`Softmax(temperature=3.0)`
+  - 邻居协作奖励采用“一跳邻居连坐 + 邻居繁荣分红”
+  - 连坐惩罚项使用度参考归一化：`sum(neighbor penalties) / degree_ref`（默认 `degree_ref=3`）
+  - 邻居危机特征聚合默认 `neighbor_urgency_pooling=max`
+  - `eMBB` 从逐 TTI 硬判改为 `20 TTI` 滑动平均吞吐评估
+  - 动作映射：`Softmax(temperature=1.0)`
 - 该设置已通过本地可行性检查：
   - `Priority Heuristic` 不再能达到系统级 `eMBB/URLLC/mMTC = 100%/100%/100%`
 
@@ -207,18 +230,23 @@ flake8 . --max-line-length=120
 - `--mode quick`：快速迭代调参（更小 batch / 更短 fragment / 更少迭代）。
 - `--mode full`：正式训练。
 - `--hw-profile balanced|maxperf`：full 模式下控制 env_runners 与 batch 规模。
+- `--algo ippo|mappo`：统一算法入口（自动推导 observation/critic/reward mixing）。
+- `--alpha`、`--beta`：仅在 `mappo` 下生效的协作强度微调参数。
+- 参数优先级（已修复覆写混乱）：
+  `CLI显式参数 > 训练脚本按算法模式的强制项(IPPO: alpha=1,beta=0,gamma=0) > env_profile 默认值`
 
 ### 4.3 默认与可复现性
-- 默认：`full + balanced(hw) + balanced(env) + pure_local + seed=[2026]`。
+- 默认：`full + balanced(hw) + balanced(env) + MAPPO(CTDE, coop参数走profile) + seed=[2026]`。
+- train/test/compare 现已改为“最小必要参数传递”，不再硬编码覆盖 profile 的物理/奖励参数。
 - 标准多种子列表保留：`[2026, 2027, 2028]`，可通过 `--seeds` 手工切换。
 - 训练结果目录按环境版本隔离：`ray_results/MAPPO_5G_Slicing_{experiment_env_tag}_seed{seed}`。
 - 当前目录标签：
-  - `harsh + pure_local -> harsh_ippo_v1`
-  - `balanced + pure_local -> balanced_ippo_v1`
-  - `harsh + neighbor_augmented -> harsh_neighbor_v4`
-  - `balanced + neighbor_augmented -> balanced_neighbor_v6`
-  - `harsh + neighbor_augmented + CTDE -> harsh_mappo_ctde_v1`
-  - `balanced + neighbor_augmented + CTDE -> balanced_mappo_ctde_v1`
+  - `harsh + pure_local -> harsh_ippo_v2`
+  - `balanced + pure_local -> balanced_ippo_v5`
+  - `harsh + neighbor_augmented -> harsh_neighbor_v5`
+  - `balanced + neighbor_augmented -> balanced_neighbor_v7`
+  - `harsh + neighbor_augmented + CTDE -> harsh_mappo_ctde_v3`
+  - `balanced + neighbor_augmented + CTDE -> balanced_mappo_ctde_v5`
 - `quick` / `full` 训练都使用 `MeanStdFilter`，不再使用 `NoFilter`。
 
 ---
@@ -252,10 +280,10 @@ flake8 . --max-line-length=120
 ### 5.4 Checkpoint 选择
 - 使用 `checkpoint_utils.rank_checkpoints_by_metric()`：
   - `compare_marl_baseline.py` 当前使用 `min_training_iteration=50`，禁止早期 checkpoint 混入正式对比
-  - 当前主排序规则：先最小化 `center_total_sla_violations = embb_viol + urllc_viol + mmtc_viol`
-  - 次排序规则：最大化 `system_throughput_mbps`（若历史日志无该指标，则回退到 `center_reward_base_tp` 作为吞吐 proxy）
-  - `quality_score` 仅作为次级辅助摘要分，不再作为首要排序依据
-  - 设计原则：先保“三 SLA 总体违约最少”，再比较吞吐，避免高吞吐掩盖 SLA 失效
+  - `test_marl.py` 当前默认 `--min-best-iter=50`，并使用 `fallback_to_any=False`，不会回退到早期 checkpoint
+  - `compare_marl_baseline.py` 对 learned policy 当前采用 `eval_sweep_system_total_sla`：
+    先对候选 checkpoint 做真实 rollout，再按 `system_total_sla_violations -> system_throughput -> system eMBB SLA -> BS_0 eMBB SLA` 排序
+  - `rank_checkpoints_by_metric()` 仍用于生成候选池；其日志排序结果不直接视为最终 baseline 选模结果
 
 ---
 
@@ -263,7 +291,7 @@ flake8 . --max-line-length=120
 
 - 修改 `multi_cell_env.py` / `train_marl.py` / 评估主逻辑后，至少执行：
 ```bash
-python smoke_test_trained_model.py
+python test_marl.py
 ```
 - 涉及训练配置或 policy mapping 变更，建议追加：
 ```bash

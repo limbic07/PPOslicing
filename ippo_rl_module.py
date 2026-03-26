@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import torch.nn as nn
 from ray.rllib.algorithms.ppo.torch.ppo_torch_rl_module import PPOTorchRLModule
@@ -6,18 +5,20 @@ from ray.rllib.core import Columns
 from ray.rllib.core.models.base import ACTOR, ENCODER_OUT
 from ray.rllib.core.rl_module.marl_module import SingleAgentRLModuleSpec
 
-DEFAULT_INITIAL_SLICE_RATIOS = np.array([0.4, 0.4, 0.2], dtype=np.float32)
 DEFAULT_INITIAL_ACTION_LOG_STD = -1.5
 # 7 cells * 12 per-cell features (demand[3], queue[3], se[3], prev_ratio[3]).
 CENTRALIZED_CRITIC_GLOBAL_DIM = 84
 
 
-def resolve_local_obs_dim(observation_mode: str) -> int:
+def resolve_local_obs_dim(
+    observation_mode: str,
+    include_ici_features: bool = False,
+) -> int:
     mode = str(observation_mode).lower()
     if mode == "pure_local":
-        return 14
+        return 9
     if mode == "neighbor_augmented":
-        return 20
+        return 19 if bool(include_ici_features) else 15
     raise ValueError(
         f"Unsupported observation_mode={observation_mode!r}. "
         "Expected one of ['pure_local', 'neighbor_augmented']"
@@ -37,17 +38,8 @@ def _activation_layer(name: str):
     raise ValueError(f"Unsupported activation={name!r}")
 
 
-def ratios_to_raw_action_means(ratios, temperature: float) -> np.ndarray:
-    ratios = np.asarray(ratios, dtype=np.float32)
-    ratios = np.clip(ratios, 1e-8, None)
-    ratios = ratios / np.sum(ratios)
-    logits = np.log(ratios)
-    logits = logits - np.mean(logits)
-    return (logits / max(float(temperature), 1e-6)).astype(np.float32)
-
-
 class InitializedPPOTorchRLModule(PPOTorchRLModule):
-    """PPO torch RLModule with a deterministic initial action prior."""
+    """PPO torch RLModule with actor masking and optional CTDE critic."""
 
     def setup(self):
         super().setup()
@@ -57,7 +49,10 @@ class InitializedPPOTorchRLModule(PPOTorchRLModule):
         self.actor_local_obs_dim = int(
             model_cfg.get(
                 "actor_local_obs_dim",
-                resolve_local_obs_dim(model_cfg.get("observation_mode", "pure_local")),
+                resolve_local_obs_dim(
+                    model_cfg.get("observation_mode", "pure_local"),
+                    include_ici_features=bool(model_cfg.get("include_ici_features", False)),
+                ),
             )
         )
         self.critic_obs_dim = int(
@@ -91,20 +86,6 @@ class InitializedPPOTorchRLModule(PPOTorchRLModule):
                 in_dim = int(hidden_dim)
             self.ctde_vf_encoder = nn.Sequential(*layers) if layers else nn.Identity()
             self.ctde_vf_head = nn.Linear(in_dim, 1)
-
-        target_ratios = model_cfg.get("initial_action_ratios", DEFAULT_INITIAL_SLICE_RATIOS)
-        temperature = model_cfg.get("action_softmax_temperature", 3.0)
-        initial_log_std = float(
-            model_cfg.get("initial_action_log_std", DEFAULT_INITIAL_ACTION_LOG_STD)
-        )
-        target_means = ratios_to_raw_action_means(target_ratios, temperature)
-
-        linear = self.pi.net.mlp[0]
-        with torch.no_grad():
-            linear.weight[:3].zero_()
-            linear.bias[:3].copy_(torch.as_tensor(target_means, dtype=linear.bias.dtype))
-            linear.weight[3:].zero_()
-            linear.bias[3:].fill_(initial_log_std)
 
     def _masked_actor_obs(self, obs: torch.Tensor) -> torch.Tensor:
         if self.actor_local_obs_dim >= self.module_obs_dim:
@@ -173,7 +154,6 @@ class InitializedPPOTorchRLModule(PPOTorchRLModule):
             output[Columns.STATE_OUT] = encoder_outs[Columns.STATE_OUT]
 
         output[Columns.VF_PREDS] = self._centralized_critic_values(batch[Columns.OBS])
-
         output[Columns.ACTION_DIST_INPUTS] = self.pi(encoder_outs[ENCODER_OUT][ACTOR])
         return output
 
@@ -188,9 +168,9 @@ def build_initialized_rl_module_spec(
     *,
     fcnet_hiddens=None,
     fcnet_activation: str = "relu",
-    initial_action_ratios=None,
     initial_action_log_std: float = DEFAULT_INITIAL_ACTION_LOG_STD,
     observation_mode: str = "pure_local",
+    include_ici_features: bool = False,
     use_centralized_critic: bool = False,
     actor_local_obs_dim: int | None = None,
     critic_obs_dim: int | None = None,
@@ -199,7 +179,7 @@ def build_initialized_rl_module_spec(
     resolved_actor_local_obs_dim = (
         int(actor_local_obs_dim)
         if actor_local_obs_dim is not None
-        else resolve_local_obs_dim(observation_mode)
+        else resolve_local_obs_dim(observation_mode, include_ici_features=include_ici_features)
     )
     resolved_critic_obs_dim = (
         int(critic_obs_dim)
@@ -213,16 +193,9 @@ def build_initialized_rl_module_spec(
             "fcnet_activation": fcnet_activation,
             "vf_hiddens": list(fcnet_hiddens or [256, 256]),
             "action_softmax_temperature": float(action_softmax_temperature),
-            "initial_action_ratios": list(
-                np.asarray(
-                    initial_action_ratios
-                    if initial_action_ratios is not None
-                    else DEFAULT_INITIAL_SLICE_RATIOS,
-                    dtype=np.float32,
-                )
-            ),
             "initial_action_log_std": float(initial_action_log_std),
             "observation_mode": str(observation_mode),
+            "include_ici_features": bool(include_ici_features),
             "use_centralized_critic": bool(use_centralized_critic),
             "actor_local_obs_dim": int(resolved_actor_local_obs_dim),
             "critic_obs_dim": int(resolved_critic_obs_dim),
